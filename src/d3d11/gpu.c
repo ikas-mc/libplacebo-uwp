@@ -322,6 +322,11 @@ pl_d3d11 pl_d3d11_get(pl_gpu gpu)
 static bool load_d3d_compiler(pl_gpu gpu)
 {
     struct pl_gpu_d3d11 *p = PL_PRIV(gpu);
+#if PL_HAVE_UWP
+    p->D3DCompile = D3DCompile;
+    p->d3d_compiler_ver = pl_get_dll_version(L"d3dcompiler_47.dll");
+    return true;
+#else
     HMODULE d3dcompiler = NULL;
 
     static const struct {
@@ -359,6 +364,7 @@ static bool load_d3d_compiler(pl_gpu gpu)
     }
 
     return false;
+#endif
 }
 
 static struct pl_gpu_fns pl_fns_d3d11 = {

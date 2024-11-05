@@ -469,13 +469,15 @@ static HRESULT create_swapchain_1_2(struct d3d11_ctx *ctx,
         // Make sure we have at least enough buffers to allow `max_latency`
         // frames in-flight at once, plus one frame for the frontbuffer
         desc.BufferCount = max_latency + 1;
-
+#if PL_HAVE_UWP
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+#else
         if (IsWindows10OrGreater()) {
             desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         } else {
             desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
         }
-
+#endif
         desc.BufferCount = PL_MIN(desc.BufferCount, DXGI_MAX_SWAP_CHAIN_BUFFERS);
     } else {
         desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
@@ -558,11 +560,17 @@ static IDXGISwapChain *create_swapchain(struct d3d11_ctx *ctx,
 
     // If both width and height are unset, the default size is the window size
     if (params->window && params->width == 0 && params->height == 0) {
+
+#if PL_HAVE_UWP
+        width = PL_DEF(1280, 1);
+        height = PL_DEF(720, 1);
+#else
         RECT rc;
         if (GetClientRect(params->window, &rc)) {
             width = PL_DEF(rc.right - rc.left, 1);
             height = PL_DEF(rc.bottom - rc.top, 1);
         }
+#endif
     }
 
     // Return here to retry creating the swapchain

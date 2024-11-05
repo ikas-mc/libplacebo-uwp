@@ -213,6 +213,8 @@ static inline uintptr_t get_prev_inst_pc(uintptr_t pc) {
 static DWORD64 get_preferred_base(const char *module)
 {
     DWORD64 image_base = 0;
+#if PL_HAVE_UWP
+#else
     HANDLE file_mapping = NULL;
     HANDLE file_view = NULL;
 
@@ -250,7 +252,7 @@ done:
         CloseHandle(file_mapping);
     if (file != INVALID_HANDLE_VALUE)
         CloseHandle(file);
-
+#endif
     return image_base;
 }
 
@@ -279,7 +281,11 @@ void pl_log_stack_trace(pl_log log, enum pl_log_level lev)
     // no need to keep it loaded all the time as stack trace printing function,
     // in theory should be used repetitively rarely.
     HANDLE process = GetCurrentProcess();
+#if PL_HAVE_UWP
+    HMODULE dbghelp = LoadPackagedLibrary(L"dbghelp.dll", 0);
+#else
     HMODULE dbghelp = LoadLibrary("dbghelp.dll");
+#endif
     DWORD options;
     SYMBOL_INFO *symbol = NULL;
     BOOL use_dbghelp = !!dbghelp;

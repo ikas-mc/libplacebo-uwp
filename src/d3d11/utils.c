@@ -202,6 +202,10 @@ HRESULT pl_d3d11_after_error(struct d3d11_ctx *ctx, HRESULT hr)
 
 struct dll_version pl_get_dll_version(const wchar_t *name)
 {
+#if PL_HAVE_UWP
+    struct dll_version ret = {0};
+    return ret;
+#else
     void *data = NULL;
     struct dll_version ret = {0};
 
@@ -230,6 +234,7 @@ struct dll_version pl_get_dll_version(const wchar_t *name)
 error:
     pl_free(data);
     return ret;
+#endif
 }
 
 wchar_t *pl_from_utf8(void *ctx, const char *str)

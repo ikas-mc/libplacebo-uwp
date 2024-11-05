@@ -157,7 +157,16 @@ components = configuration_data()
 subdir('glsl')
 subdir('d3d11')
 subdir('opengl')
-subdir('vulkan')
+
+uwp = get_option('uwp')
+if uwp.allowed()
+  components.set('uwp', uwp.allowed())
+  #link_args += ['-ld3dcompiler_47','-ld3d11','-ldxgi']
+  #link_args += ['-static-libstdc++']
+  components.set('vulkan',false)
+else
+  subdir('vulkan')
+endif
 
 lcms = dependency('lcms2', version: '>=2.9', required: get_option('lcms'))
 components.set('lcms', lcms.found())
@@ -190,7 +199,10 @@ if libdovi.found()
   build_deps += libdovi
 endif
 
-inc_dirs = [ vulkan_headers_inc ]
+inc_dirs = []
+if components.get('vulkan')
+inc_dirs += [ vulkan_headers_inc ]
+endif
 
 xxhash = dependency('libxxhash', required: get_option('xxhash'))
 components.set('xxhash', xxhash.found())
@@ -241,6 +253,7 @@ endif
 if fs.is_dir('../3rdparty/fast_float/include')
   inc_dirs += include_directories('../3rdparty/fast_float/include')
 endif
+
 
 ### Main library build process
 inc = include_directories('./include')

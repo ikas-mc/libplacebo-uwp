@@ -5,7 +5,7 @@ d3d11_headers_extra = [ # needed internally
   cc.check_header('dxgi1_6.h', required: d3d11),
 ]
 d3d11_deps = [
-  dependency('spirv-cross-c-shared', version: '>=0.29.0', required: d3d11),
+  dependency('spirv-cross-c', version: '>=0.29.0', required: d3d11),
   cc.find_library('version', required: d3d11),
 ]
 

@@ -432,7 +432,7 @@ endif
 
 # OS specific build options
 if host_machine.system() == 'windows'
-    build_opts += ['-D_WIN32_WINNT=0x0601',
+    build_opts += ['-D_WIN32_WINNT=0x0A00',
                    '-D_USE_MATH_DEFINES',
                    '-DWIN32_LEAN_AND_MEAN',
                    '-DNOMINMAX',

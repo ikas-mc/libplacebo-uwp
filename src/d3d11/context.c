@@ -36,6 +36,17 @@ static void d3d11_load(void)
 
     if (bPending)
     {
+#if PL_HAVE_UWP
+        pD3D11CreateDevice = (void *)D3D11CreateDevice;
+        pCreateDXGIFactory1 = (void *)CreateDXGIFactory1;
+#ifdef PL_HAVE_DXGI_DEBUG
+        HMODULE dxgi_debug = LoadPackagedLibrary(L"dxgidebug.dll", 0);
+        if (dxgi_debug) {
+            pDXGIGetDebugInterface = (void *)
+                GetProcAddress(dxgi_debug, "DXGIGetDebugInterface");
+        }
+#endif
+#else //PL_HAVE_UWP
         HMODULE d3d11 = LoadLibraryW(L"d3d11.dll");
         if (d3d11) {
             pD3D11CreateDevice = (void *)
@@ -55,6 +66,7 @@ static void d3d11_load(void)
                 GetProcAddress(dxgi_debug, "DXGIGetDebugInterface");
         }
 #endif
+#endif //PL_HAVE_UWP
     }
 
     InitOnceComplete(&d3d11_once, 0, NULL);

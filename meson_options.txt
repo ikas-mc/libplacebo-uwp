@@ -53,3 +53,6 @@ option('xxhash', type: 'feature', value: 'auto',
 
 option('debug-abort', type: 'boolean', value: false,
        description: 'abort() on most runtime errors (only for debugging purposes)')
+
+option('uwp', type: 'feature', value: 'auto',
+       description: 'Uwp')
