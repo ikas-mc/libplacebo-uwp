@@ -339,7 +339,6 @@ if get_option('bench')
     dependencies: [tdep_shared, vulkan_headers],
     link_args: link_args,
     link_depends: link_depends,
-    include_directories: vulkan_headers_inc,
   )
   test('benchmark', bench, is_parallel: false, timeout: 600)
 endif

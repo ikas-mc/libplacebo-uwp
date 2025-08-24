@@ -14,9 +14,6 @@
 #define PL_BASENAME basename
 #endif
 
-#ifdef HAVE_NUKLEAR
-#include "ui.h"
-
 bool parse_args(struct plplay_args *args, int argc, char *argv[])
 {
     static struct option long_options[] = {
@@ -88,6 +85,9 @@ error:
     fprintf(stderr, "  -w, --window    Specify the windowing API\n");
     return false;
 }
+
+#ifdef HAVE_NUKLEAR
+#include "ui.h"
 
 static void add_hook(struct plplay *p, const struct pl_hook *hook, const char *path)
 {
@@ -428,6 +428,7 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                 [PL_DEINTERLACE_WEAVE]  = "Field weaving (no-op)",
                 [PL_DEINTERLACE_BOB]    = "Naive bob (line doubling)",
                 [PL_DEINTERLACE_YADIF]  = "Yadif (\"yet another deinterlacing filter\")",
+                [PL_DEINTERLACE_BWDIF]  = "Bwdif (\"bob weaver deinterlacing filter\")",
             };
 
             nk_label(nk, "Deinterlacing algorithm", NK_TEXT_LEFT);
@@ -437,6 +438,7 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
             switch (dpar->algo) {
             case PL_DEINTERLACE_WEAVE:
             case PL_DEINTERLACE_BOB:
+            case PL_DEINTERLACE_BWDIF:
                 break;
             case PL_DEINTERLACE_YADIF:
                 nk_checkbox_label(nk, "Skip spatial check", &dpar->skip_spatial_check);

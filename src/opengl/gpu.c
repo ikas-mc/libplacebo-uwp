@@ -16,6 +16,7 @@
  */
 
 #include "gpu.h"
+#include "hash.h"
 #include "common.h"
 #include "formats.h"
 #include "utils.h"
@@ -117,6 +118,9 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
     int ver = pl_gl->major * 10 + pl_gl->minor;
     p->gl_ver = glsl->gles ? 0 : ver;
     p->gles_ver = glsl->gles ? ver : 0;
+    p->sig = pl_str0_hash((const char *) gl->GetString(GL_VERSION));
+    pl_hash_merge(&p->sig, pl_str0_hash((const char *) gl->GetString(GL_VENDOR)));
+    pl_hash_merge(&p->sig, pl_str0_hash((const char *) gl->GetString(GL_RENDERER)));
 
     // If possible, query the GLSL version from the implementation
     const char *glslver_p = (char *) gl->GetString(GL_SHADING_LANGUAGE_VERSION);
@@ -155,7 +159,7 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
     }
 
     if (gl_test_ext(gpu, "GL_ARB_compute_shader", 43, 0) && glsl->version >= 420) {
-        glsl->compute = true;
+        glsl->compute = !params->no_compute;
         get(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE, &glsl->max_shmem_size);
         get(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, &glsl->max_group_threads);
         for (int i = 0; i < 3; i++)

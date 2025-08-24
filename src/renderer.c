@@ -77,7 +77,7 @@ struct pl_renderer_t {
 
     // Temporary storage for vertex/index data
     PL_ARRAY(struct osd_vertex) osd_vertices;
-    PL_ARRAY(uint16_t) osd_indices;
+    PL_ARRAY(uint32_t) osd_indices;
     struct pl_vertex_attrib osd_attribs[3];
 
     // Frame cache (for frame mixing / interpolation)
@@ -994,6 +994,7 @@ static void draw_overlays(struct pass_state *pass, pl_tex fbo,
             .vertex_count = rr->osd_indices.num,
             .vertex_data = rr->osd_vertices.elem,
             .index_data = rr->osd_indices.elem,
+            .index_fmt = PL_INDEX_UINT32,
         ));
 
         if (!ok) {
@@ -1235,6 +1236,7 @@ struct plane_state {
     enum plane_type type;
     struct pl_plane plane;
     struct img img; // for per-plane shaders
+    pl_fmt fmt; // per-plane format after merge
     float plane_w, plane_h; // logical plane dimensions
 };
 
@@ -1458,8 +1460,13 @@ static pl_fmt merge_fmt(struct pass_state *pass, const struct img *a,
     // Only return formats that support all relevant caps of both formats
     const enum pl_fmt_caps mask = PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR;
     enum pl_fmt_caps req_caps = (fmta->caps & mask) | (fmtb->caps & mask);
+    enum pl_fmt_type req_type = fmta->type;
 
-    return pl_find_fmt(rr->gpu, fmta->type, num_comps, min_depth, 0, req_caps);
+    // If we have integer formats on input, convert now to FBO format.
+    if (req_type == PL_FMT_UINT)
+        return pass->fbofmt[num_comps];
+
+    return pl_find_fmt(rr->gpu, req_type, num_comps, min_depth, 0, req_caps);
 }
 
 // Applies a series of rough heuristics to figure out whether we expect any
@@ -1542,6 +1549,7 @@ static bool pass_read_image(struct pass_state *pass)
                 .color = image->color,
                 .comps = image->planes[i].components,
             },
+            .fmt = image->planes[i].texture->params.format,
         };
 
         // Explicitly skip alpha channel when overridden
@@ -1625,22 +1633,32 @@ static bool pass_read_image(struct pass_state *pass)
             if (!sub)
                 break; // skip merging
 
+            int comp_map[4] = {-1, -1, -1, -1};
+            for (int ic = 0; ic < sti->img.comps; ic++) {
+                int map = sti->plane.component_mapping[sti->fmt->sample_order[ic]];
+                if (map == PL_CHANNEL_NONE)
+                    continue;
+                comp_map[fmt->sample_order[ic]] = map;
+            }
+
             sh_describe(sh, "merging planes");
             GLSL("{                 \n"
                  "vec4 tmp = "$"(); \n", sub);
             for (int jc = 0; jc < stj->img.comps; jc++) {
-                int map = stj->plane.component_mapping[jc];
+                int map = stj->plane.component_mapping[stj->fmt->sample_order[jc]];
                 if (map == PL_CHANNEL_NONE)
                     continue;
                 int ic = sti->img.comps++;
                 pl_assert(ic < 4);
                 GLSL("color[%d] = tmp[%d]; \n", ic, jc);
                 sti->plane.components = sti->img.comps;
-                sti->plane.component_mapping[ic] = map;
+                comp_map[fmt->sample_order[ic]] = map;
             }
             GLSL("} \n");
 
             sti->img.fmt = fmt;
+            sti->fmt = fmt;
+            memcpy(sti->plane.component_mapping, comp_map, sizeof(comp_map));
             pl_dispatch_abort(rr->dp, &stj->img.sh);
             *stj = (struct plane_state) {0};
             did_merge = true;
@@ -1654,6 +1672,20 @@ static bool pass_read_image(struct pass_state *pass)
             memset(pass->fbofmt, 0, sizeof(pass->fbofmt));
             rr->errors |= PL_RENDER_ERR_FBO;
             return false;
+        }
+    }
+
+    // If plane was not merged, convert it alone.
+    for (int i = 0; i < image->num_planes; i++) {
+        struct plane_state *st = &planes[i];
+        if (!want_merge(pass, st, ref))
+            continue;
+
+        if (st->img.tex && st->img.tex->params.format->type == PL_FMT_UINT) {
+            st->img.sh = img_sh(pass, &st->img);
+            st->img.err_msg = "Integer conversion failed";
+            sh_describe(st->img.sh, "integer conversion");
+            st->img.fmt = NULL; // pick float format instead
         }
     }
 
@@ -1812,6 +1844,7 @@ static bool pass_read_image(struct pass_state *pass)
             st->img.rect.x0 = st->img.rect.y0 = 0.0f;
             st->img.w = st->img.rect.x1 = src.new_w;
             st->img.h = st->img.rect.y1 = src.new_h;
+            src.scale = 1.0;
         }
 
         pass_hook(pass, &st->img, plane_scaled_hook_stages[st->type]);
@@ -1826,11 +1859,12 @@ static bool pass_read_image(struct pass_state *pass)
             pl_assert(sub);
         }
 
-        GLSL("tmp = "$"(); \n", sub);
+        GLSL("tmp = vec4("$") * "$"(); \n", SH_FLOAT(src.scale), sub);
         for (int c = 0; c < src.components; c++) {
             if (plane->component_mapping[c] < 0)
                 continue;
-            GLSL("color[%d] = tmp[%d];\n", plane->component_mapping[c], c);
+            GLSL("color[%d] = tmp[%d];\n", plane->component_mapping[c],
+                 st->fmt->sample_order[c]);
         }
 
         // we don't need it anymore
@@ -1868,7 +1902,6 @@ static bool pass_read_image(struct pass_state *pass)
         // Fix bit depth normalization before applying LUT
         float scale = pl_color_repr_normalize(&pass->img.repr);
         GLSL("color *= vec4("$"); \n", SH_FLOAT(scale));
-        pl_shader_set_alpha(sh, &pass->img.repr, PL_ALPHA_INDEPENDENT);
         pl_shader_custom_lut(sh, image->lut, &rr->lut_state[LUT_IMAGE]);
 
         if (lut_type == PL_LUT_CONVERSION) {
@@ -2411,8 +2444,14 @@ static bool pass_output_target(struct pass_state *pass)
     enum pl_clear_mode background = params->background;
     if (params->blend_against_tiles)
         background = PL_CLEAR_TILES;
+    else if (params->skip_target_clearing)
+        background = PL_CLEAR_SKIP;
 
+    /* Avoid unnecessary round trip through premultiplied alpha */
     bool has_alpha = target->repr.alpha != PL_ALPHA_NONE || params->blend_params;
+    if (params->background_transparency >= 1.0 && has_alpha)
+        background = PL_CLEAR_SKIP;
+
     bool need_blend = background != PL_CLEAR_SKIP || !has_alpha;
     if (img->comps == 4 && need_blend) {
         pl_shader_set_alpha(sh, &img->repr, PL_ALPHA_PREMULTIPLIED);
@@ -2423,7 +2462,7 @@ static bool pass_output_target(struct pass_state *pass)
                  SH_FLOAT(params->background_color[1]),
                  SH_FLOAT(params->background_color[2]),
                  SH_FLOAT(1.0 - params->background_transparency));
-            if (!params->background_transparency) {
+            if (!params->background_transparency || !has_alpha) {
                 img->repr.alpha = PL_ALPHA_NONE;
                 img->comps = 3;
             }
@@ -2450,18 +2489,25 @@ static bool pass_output_target(struct pass_state *pass)
         }
     }
 
+
     // Apply the color scale separately, after encoding is done, to make sure
     // that the intermediate FBO (if any) has the correct precision.
     struct pl_color_repr repr = target->repr;
     float scale = pl_color_repr_normalize(&repr);
+
+    // If the alpha mode is already applied, don't double-apply it
+    if (img->repr.alpha == repr.alpha || img->comps < 4) {
+        repr.alpha = PL_ALPHA_NONE;
+    } else {
+        // `pl_shader_encode_color` expects independent alpha
+        pl_shader_set_alpha(sh, &img->repr, PL_ALPHA_INDEPENDENT);
+    }
+
     enum pl_lut_type lut_type = guess_frame_lut_type(target, true);
     if (lut_type != PL_LUT_CONVERSION)
         pl_shader_encode_color(sh, &repr);
-    if (lut_type == PL_LUT_NATIVE) {
-        pl_shader_set_alpha(sh, &img->repr, PL_ALPHA_INDEPENDENT);
+    if (lut_type == PL_LUT_NATIVE)
         pl_shader_custom_lut(sh, target->lut, &rr->lut_state[LUT_TARGET]);
-        pl_shader_set_alpha(sh, &img->repr, PL_ALPHA_PREMULTIPLIED);
-    }
 
     // Rotation handling
     if (pass->rotation % PL_ROTATION_180 == PL_ROTATION_90) {
@@ -2543,6 +2589,9 @@ static bool pass_output_target(struct pass_state *pass)
                 src.component_mask |= 1 << plane->component_mapping[c];
             }
 
+            if (params->blend_params) /* preserve alpha if blending */
+                src.component_mask |= 1 << PL_CHANNEL_A;
+
             sh = pl_dispatch_begin(rr->dp);
             dispatch_sampler(pass, sh, &rr->samplers_dst[p], SAMPLER_PLANE,
                              plane->texture, &src);
@@ -2592,7 +2641,11 @@ static bool pass_output_target(struct pass_state *pass)
             rr->prev_dither = applied_dither;
         }
 
-        GLSL("color *= vec4(1.0 / "$"); \n", SH_FLOAT(scale));
+        GLSL("color.%s *= vec%d(1.0 / "$"); \n",
+             params->blend_params ? "rgb" : "rgba",
+             params->blend_params ? 3 : 4,
+             SH_FLOAT(scale));
+
         swizzle_color(sh, plane->components, plane->component_mapping,
                       params->blend_params);
 
@@ -2852,6 +2905,15 @@ static void fix_frame(struct pl_frame *frame)
     if (tex && !frame->color.primaries)
         frame->color.primaries = pl_color_primaries_guess(tex->params.w, tex->params.h);
 
+    bool has_alpha = false;
+    for (int p = 0; p < frame->num_planes; p++) {
+        for (int c = 0; c < frame->planes[p].components; c++)
+            has_alpha |= frame->planes[p].component_mapping[c] == PL_CHANNEL_A;
+    }
+
+    if (!has_alpha)
+        frame->repr.alpha = PL_ALPHA_NONE;
+
     // For UNORM formats, we can infer the sampled bit depth from the texture
     // itself. This is ignored for other format types, because the logic
     // doesn't really work out for them anyways, and it's best not to do
@@ -2961,35 +3023,14 @@ static void pass_fix_frames(struct pass_state *pass)
         pl_color_space_infer(&target->color);
     }
 
-    // Detect the presence of an alpha channel in the frames and explicitly
-    // default the alpha mode in this case, so we can use it to detect whether
-    // or not to strip the alpha channel during rendering.
-    //
     // Note the different defaults for the image and target, because files
     // are usually independent but windowing systems usually expect
-    // premultiplied. (We also premultiply for internal rendering, so this
-    // way of doing it avoids a possible division-by-zero path!)
-    if (image && !image->repr.alpha) {
-        image->repr.alpha = PL_ALPHA_NONE;
-        for (int i = 0; i < image->num_planes; i++) {
-            const struct pl_plane *plane = &image->planes[i];
-            for (int c = 0; c < plane->components; c++) {
-                if (plane->component_mapping[c] == PL_CHANNEL_A)
-                    image->repr.alpha = PL_ALPHA_INDEPENDENT;
-            }
-        }
-    }
+    // premultiplied.
+    if (image && image->repr.alpha == PL_ALPHA_UNKNOWN)
+        image->repr.alpha = PL_ALPHA_INDEPENDENT;
 
-    if (!target->repr.alpha) {
-        target->repr.alpha = PL_ALPHA_NONE;
-        for (int i = 0; i < target->num_planes; i++) {
-            const struct pl_plane *plane = &target->planes[i];
-            for (int c = 0; c < plane->components; c++) {
-                if (plane->component_mapping[c] == PL_CHANNEL_A)
-                    target->repr.alpha = PL_ALPHA_PREMULTIPLIED;
-            }
-        }
-    }
+    if (target->repr.alpha == PL_ALPHA_UNKNOWN)
+        target->repr.alpha = PL_ALPHA_PREMULTIPLIED;
 }
 
 void pl_frames_infer(pl_renderer rr, struct pl_frame *image,
@@ -3073,10 +3114,6 @@ static bool draw_empty_overlays(pl_renderer rr,
                                 const struct pl_frame *ptarget,
                                 const struct pl_render_params *params)
 {
-    clear_target(rr, ptarget, params);
-    if (!ptarget->num_overlays)
-        return true;
-
     struct pass_state pass = {
         .rr = rr,
         .params = params,
@@ -3088,6 +3125,10 @@ static bool draw_empty_overlays(pl_renderer rr,
 
     if (!pass_init(&pass, false))
         return false;
+
+    clear_target(rr, ptarget, params);
+    if (!ptarget->num_overlays)
+        goto done;
 
     pass_begin_frame(&pass);
     struct pl_frame *target = &pass.target;
@@ -3117,6 +3158,7 @@ static bool draw_empty_overlays(pl_renderer rr,
                       &tscale);
     }
 
+done:
     pass_uninit(&pass);
     return true;
 }
