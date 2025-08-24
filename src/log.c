@@ -213,8 +213,7 @@ static inline uintptr_t get_prev_inst_pc(uintptr_t pc) {
 static DWORD64 get_preferred_base(const char *module)
 {
     DWORD64 image_base = 0;
-#if PL_HAVE_UWP
-#else
+#if !PL_HAVE_UWP
     HANDLE file_mapping = NULL;
     HANDLE file_view = NULL;
 
@@ -260,7 +259,7 @@ void pl_log_stack_trace(pl_log log, enum pl_log_level lev)
 {
     if (!pl_msg_test(log, lev))
         return;
-
+#if !PL_HAVE_UWP
     void *tmp = pl_tmp(NULL);
     PL_ARRAY(void *) frames = {0};
 
@@ -281,11 +280,8 @@ void pl_log_stack_trace(pl_log log, enum pl_log_level lev)
     // no need to keep it loaded all the time as stack trace printing function,
     // in theory should be used repetitively rarely.
     HANDLE process = GetCurrentProcess();
-#if PL_HAVE_UWP
-    HMODULE dbghelp = LoadPackagedLibrary(L"dbghelp.dll", 0);
-#else
     HMODULE dbghelp = LoadLibrary("dbghelp.dll");
-#endif
+
     DWORD options;
     SYMBOL_INFO *symbol = NULL;
     BOOL use_dbghelp = !!dbghelp;
@@ -413,6 +409,7 @@ done:
     if (dbghelp)
         FreeLibrary(dbghelp);
     pl_free(tmp);
+#endif
 }
 
 #elif defined(PL_HAVE_UNWIND)
