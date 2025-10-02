@@ -12,6 +12,8 @@ project('libplacebo', ['c', 'cpp'],
     7,
     # API version
     {
+      '356': 'pl_avframe_set_repr now sets frame.alpha_mode',
+      '355': 'add PL_CLEAR_BLUR and pl_render_params.blur_radius',
       '354': 'pl_shader_{encode,decode}_color no longer linearizes/delinearizes XYZ',
       '353': 'add PL_DEINTERLACE_BWDIF',
       '352': 'add pl_gpu_limits.host_ptr_slow',
