@@ -82,7 +82,7 @@ static inline void reshape_mmr(pl_shader sh, ident_t mmr, bool single,
 
         if (max_order == 3) {
             if (min_order < 3)
-                GLSL("if (order >= 3 { \n");
+                GLSL("if (order >= 3) { \n");
 
             GLSL("s += dot("$"[mmr_idx + 4].xyz, sig2 * sig);   \n"
                  "s += dot("$"[mmr_idx + 5], sigX2 * sigX);     \n",
@@ -433,6 +433,8 @@ void pl_shader_decode_color(pl_shader sh, struct pl_color_repr *repr,
     case PL_COLOR_SYSTEM_SMPTE_240M:
     case PL_COLOR_SYSTEM_BT_2020_NC:
     case PL_COLOR_SYSTEM_YCGCO:
+    case PL_COLOR_SYSTEM_YCGCO_RE:
+    case PL_COLOR_SYSTEM_YCGCO_RO:
         break; // no special post-processing needed
 
     case PL_COLOR_SYSTEM_COUNT:
@@ -533,6 +535,8 @@ void pl_shader_encode_color(pl_shader sh, const struct pl_color_repr *repr)
     case PL_COLOR_SYSTEM_SMPTE_240M:
     case PL_COLOR_SYSTEM_BT_2020_NC:
     case PL_COLOR_SYSTEM_YCGCO:
+    case PL_COLOR_SYSTEM_YCGCO_RE:
+    case PL_COLOR_SYSTEM_YCGCO_RO:
         break; // no special pre-processing needed
 
     case PL_COLOR_SYSTEM_COUNT:
@@ -795,7 +799,7 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
         const float b = sqrtf(3 * powf(csp_min / csp_max, 1 / y));
         // OOTF^-1
         GLSL("color.rgb *= 1.0 / "$";                                       \n"
-             "color.rgb *= 12.0 * max(1e-6, pow(dot("$", color.rgb), "$")); \n",
+             "color.rgb *= 12.0 * pow(max(1e-6, dot("$", color.rgb)), "$"); \n",
              SH_FLOAT(csp_max), sh_luma_coeffs(sh, csp), SH_FLOAT((1 - y) / y));
         // OETF
         GLSL("color.rgb = mix(vec3(0.5) * sqrt(color.rgb),                      \n"
