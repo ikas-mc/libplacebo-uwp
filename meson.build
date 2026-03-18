@@ -6,12 +6,16 @@ project('libplacebo', ['c', 'cpp'],
     'c_std=c11',
     'cpp_std=c++20',
   ],
-  meson_version: '>=0.63',
+  meson_version: '>=1.3.0',
   version: '@0@.@1@.@2@'.format(
     # Major version
     7,
     # API version
     {
+      '362': 'add PL_COLOR_TRC_SCRGB',
+      '361': 'pl_swapchain_colorspace_hint can map VK_COLOR_SPACE_PASS_THROUGH_EXT',
+      '360': 'add pl_d3d11_swapchain_params.{alpha,color}_bits',
+      '359': 'add pl_vulkan_swapchain_params.{alpha,color}_bits',
       '358': 'add PL_COLOR_SYSTEM_YCGCO_{RE,RO}',
       '357': 'add pl_daylight_from_temp, pl_blackbody_from_temp, and generalize pl_white_from_temp',
       '356': 'pl_avframe_set_repr now sets frame.alpha_mode',

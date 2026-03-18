@@ -100,6 +100,11 @@ static bool map_color_space(VkColorSpaceKHR space, struct pl_color_space *out)
         };
         return true;
     case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
+        *out = (struct pl_color_space) {
+            .primaries = PL_COLOR_PRIM_BT_709,
+            .transfer  = PL_COLOR_TRC_SCRGB,
+        };
+        return true;
     case VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT:
         // TODO
         return false;
@@ -143,11 +148,12 @@ static bool map_color_space(VkColorSpaceKHR space, struct pl_color_space *out)
         };
         return true;
     case VK_COLOR_SPACE_PASS_THROUGH_EXT:
-        // On color-managed Wayland compositors, it behaves similar to
-        // VK_COLOR_SPACE_SRGB_NONLINEAR_KHR as they would treat un-tagged surface
-        // as sRGB, but on other OSes it's behavior is not clearly defined, so
-        // don't use it.
-        return false;
+        // Platform specific output color space, map to unknown
+        *out = (struct pl_color_space) {
+            .primaries = PL_COLOR_PRIM_UNKNOWN,
+            .transfer  = PL_COLOR_TRC_UNKNOWN,
+        };
+        return true;
 
 #ifdef VK_AMD_display_native_hdr
     case VK_COLOR_SPACE_DISPLAY_NATIVE_AMD:
@@ -159,13 +165,20 @@ static bool map_color_space(VkColorSpaceKHR space, struct pl_color_space *out)
     }
 }
 
+static inline int quant_score(int depth, int requested)
+{
+    pl_assert(depth >= 0 && depth <= 16);
+    pl_assert(requested >= 0 && requested <= 16);
+    return requested <= depth ? 0 : 17 * (16 - depth) + requested - depth;
+}
+
 static bool pick_surf_format(pl_swapchain sw, const struct pl_color_space *hint)
 {
     struct priv *p = PL_PRIV(sw);
     struct vk_ctx *vk = p->vk;
     pl_gpu gpu = sw->gpu;
 
-    int best_score = 0, best_id;
+    int best_score = -1000, best_id;
     bool wide_gamut = pl_color_primaries_is_wide_gamut(hint->primaries);
     bool prefer_hdr = pl_color_transfer_is_hdr(hint->transfer);
 
@@ -197,8 +210,11 @@ static bool pick_surf_format(pl_swapchain sw, const struct pl_color_space *hint)
                 case 8:
                     if (pl_color_transfer_is_hdr(space.transfer))
                         score += 10;
-                    else if (space.transfer == PL_COLOR_TRC_LINEAR)
+                    else if (space.transfer == PL_COLOR_TRC_LINEAR ||
+                             space.transfer == PL_COLOR_TRC_SCRGB)
                         continue; // avoid 8-bit linear formats
+                    else if (space.transfer == PL_COLOR_TRC_UNKNOWN)
+                        score += 10;
                     else if (disable10)
                         score += 30;
                     else
@@ -207,8 +223,11 @@ static bool pick_surf_format(pl_swapchain sw, const struct pl_color_space *hint)
                 case 10:
                     if (pl_color_transfer_is_hdr(space.transfer))
                         score += 30;
-                    else if (space.transfer == PL_COLOR_TRC_LINEAR)
+                    else if (space.transfer == PL_COLOR_TRC_LINEAR ||
+                             space.transfer == PL_COLOR_TRC_SCRGB)
                         continue; // avoid 10-bit linear formats
+                    else if (space.transfer == PL_COLOR_TRC_UNKNOWN)
+                        score += 20;
                     else if (disable10)
                         score += 20;
                     else
@@ -217,7 +236,10 @@ static bool pick_surf_format(pl_swapchain sw, const struct pl_color_space *hint)
                 case 16:
                     if (pl_color_transfer_is_hdr(space.transfer))
                         score += 20;
-                    else if (space.transfer == PL_COLOR_TRC_LINEAR)
+                    else if (space.transfer == PL_COLOR_TRC_LINEAR ||
+                             space.transfer == PL_COLOR_TRC_SCRGB)
+                        score += 30;
+                    else if (space.transfer == PL_COLOR_TRC_UNKNOWN)
                         score += 30;
                     else if (disable10)
                         score += 10;
@@ -227,6 +249,12 @@ static bool pick_surf_format(pl_swapchain sw, const struct pl_color_space *hint)
                 default: // skip any other format
                     continue;
             }
+            int alpha_depth = plfmt->num_components < 4 ? 0 : PL_MIN(plfmt->component_depth[3], 16);
+            int err = quant_score(plfmt->component_depth[0], PL_MIN(p->params.color_bits, 16)) +
+                      quant_score(alpha_depth, PL_MIN(p->params.alpha_bits, 16));
+            // Reset score if we don't meet the requested bit depth
+            if (err)
+                score = -err;
 #ifdef __APPLE__
             // On Apple hardware, only these formats allow direct-to-display
             // rendering, so give them a slight score boost to tie-break against
@@ -255,6 +283,8 @@ static bool pick_surf_format(pl_swapchain sw, const struct pl_color_space *hint)
                 score += 10000;
             if (space.transfer == hint->transfer)
                 score += 20000;
+            else if (space.transfer == PL_COLOR_TRC_UNKNOWN)
+                continue; // allow unknown (PASS_THROUGH_EXT) only if requested
 
             switch (plfmt->type) {
             case PL_FMT_UNKNOWN: break;
@@ -274,7 +304,7 @@ static bool pick_surf_format(pl_swapchain sw, const struct pl_color_space *hint)
         }
     }
 
-    if (!best_score) {
+    if (best_score == -1000) {
         PL_ERR(vk, "Failed picking any valid, renderable surface format!");
         return false;
     }
@@ -721,7 +751,17 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
     p->cur_width = sinfo.imageExtent.width;
     p->cur_height = sinfo.imageExtent.height;
 
-    if (p->has_swapchain_maintenance1)
+    bool use_deferred_alloc = p->has_swapchain_maintenance1;
+
+    // NVIDIA's drivers have a bug where using deferred memory allocation
+    // causes crashes in the driver. It's unclear why exactly it happens, but
+    // the issue is consistent across Windows and Linux drivers.
+    // See for more info <https://github.com/mpv-player/mpv/issues/17318>,
+    // <https://github.com/mpv-player/mpv/issues/17543>
+    if (vk->props.vendorID == VK_VENDOR_ID_NVIDIA)
+        use_deferred_alloc = false;
+
+    if (use_deferred_alloc)
         sinfo.flags |= VK_SWAPCHAIN_CREATE_DEFERRED_MEMORY_ALLOCATION_BIT_KHR;
 
     PL_DEBUG(sw, "(Re)creating swapchain of size %dx%d",
@@ -1023,7 +1063,9 @@ static void vk_sw_colorspace_hint(pl_swapchain sw, const struct pl_color_space *
 
     // This should never fail if the swapchain already exists
     bool ok = pick_surf_format(sw, csp);
-    set_hdr_metadata(p, &csp->hdr);
+    // Don't try to apply anything for VK_COLOR_SPACE_PASS_THROUGH_EXT
+    if (csp->transfer != PL_COLOR_TRC_UNKNOWN)
+        set_hdr_metadata(p, &csp->hdr);
     pl_assert(ok);
 
     pl_mutex_unlock(&p->lock);
