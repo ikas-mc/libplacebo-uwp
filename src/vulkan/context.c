@@ -82,6 +82,7 @@ static const struct vk_fun vk_inst_funs[] = {
     // behind various VkSurfaceKHR values already being provided by the API
     // user (implying this extension is loaded).
     PL_VK_INST_FUN(GetPhysicalDeviceSurfaceCapabilitiesKHR),
+    PL_VK_INST_FUN(GetPhysicalDeviceSurfaceCapabilities2KHR),
     PL_VK_INST_FUN(GetPhysicalDeviceSurfaceFormatsKHR),
     PL_VK_INST_FUN(GetPhysicalDeviceSurfacePresentModesKHR),
     PL_VK_INST_FUN(GetPhysicalDeviceSurfaceSupportKHR),
@@ -435,7 +436,7 @@ static const struct vk_fun vk_dev_funs[] = {
     PL_VK_DEV_FUN(FreeCommandBuffers),
     PL_VK_DEV_FUN(FreeMemory),
     PL_VK_DEV_FUN(GetBufferMemoryRequirements),
-    PL_VK_DEV_FUN(GetDeviceQueue),
+    PL_VK_DEV_FUN(GetDeviceQueue2),
     PL_VK_DEV_FUN(GetImageMemoryRequirements2),
     PL_VK_DEV_FUN(GetImageSubresourceLayout),
     PL_VK_DEV_FUN(GetPipelineCacheData),
@@ -1339,6 +1340,11 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
         goto error;
     }
 
+#ifdef VK_KHR_internally_synchronized_queues
+    if (has_synchronized_queues(&vk->features))
+        vk->queue_flags |= VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR;
+#endif
+
     // Enable all queues at device creation time, to maximize compatibility
     // with other API users (e.g. FFmpeg)
     PL_ARRAY(VkDeviceQueueCreateInfo) qinfos = {0};
@@ -1347,14 +1353,9 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
         use_qf |= qfs[i].queueFlags & params->extra_queues;
         if (!use_qf)
             continue;
-        VkDeviceQueueCreateFlags qflags = 0;
-#ifdef VK_KHR_internally_synchronized_queues
-        if (has_synchronized_queues(&vk->features))
-            qflags |= VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR;
-#endif
         PL_ARRAY_APPEND(tmp, qinfos, (VkDeviceQueueCreateInfo) {
             .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-            .flags = qflags,
+            .flags = vk->queue_flags,
             .queueFamilyIndex = i,
             .queueCount = qfs[i].queueCount,
             .pQueuePriorities = pl_calloc(tmp, qfs[i].queueCount, sizeof(float)),
