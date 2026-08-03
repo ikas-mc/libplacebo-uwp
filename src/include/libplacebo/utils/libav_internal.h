@@ -25,9 +25,11 @@
 
 #include <libplacebo/utils/dolbyvision.h>
 
+#include <libavutil/common.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_drm.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/macros.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/display.h>
 #include <libavformat/version.h>
@@ -343,7 +345,6 @@ PL_LIBAV_API void pl_map_hdr_metadata(struct pl_hdr_metadata *out,
     }
 
     if (data->dhp && data->dhp->application_version < 2) {
-        float hist_max = 0;
         const AVHDRPlusColorTransformParams *pars = &data->dhp->params[0];
         assert(data->dhp->num_windows > 0);
         out->scene_max[0] = 10000 * av_q2d(pars->maxscl[0]);
@@ -351,22 +352,48 @@ PL_LIBAV_API void pl_map_hdr_metadata(struct pl_hdr_metadata *out,
         out->scene_max[2] = 10000 * av_q2d(pars->maxscl[2]);
         out->scene_avg = 10000 * av_q2d(pars->average_maxrgb);
 
-        // Calculate largest value from histogram to use as fallback for clips
-        // with missing MaxSCL information. Note that this may end up picking
-        // the "reserved" value at the 5% percentile, which in practice appears
-        // to track the brightest pixel in the scene.
-        for (int i = 0; i < pars->num_distribution_maxrgb_percentiles; i++) {
-            float hist_val = av_q2d(pars->distribution_maxrgb[i].percentile);
-            if (hist_val > hist_max)
-                hist_max = hist_val;
-        }
-        hist_max *= 10000;
+        // ST 2094-40 B.3: when MaxSCL is missing, the fallback is
+        // DistributionMaxRGBPercentiles[Ω], the last element of maxrgb dist.
+        uint8_t n = pars->num_distribution_maxrgb_percentiles;
+        float scene_max_hist = n > 0
+            ? 10000 * av_q2d(pars->distribution_maxrgb[n - 1].percentile)
+            : 0;
         if (!out->scene_max[0])
-            out->scene_max[0] = hist_max;
+            out->scene_max[0] = scene_max_hist;
         if (!out->scene_max[1])
-            out->scene_max[1] = hist_max;
+            out->scene_max[1] = scene_max_hist;
         if (!out->scene_max[2])
-            out->scene_max[2] = hist_max;
+            out->scene_max[2] = scene_max_hist;
+
+        // ST 2094-40 8.5.4 defines the constraints on the histogram values in
+        // metadata. Specifically the 5% (V1) and 10% (V2) values are not part of
+        // the CDF in app_ver=1. They must be initialized to V1=0.00000, V2=0.00255.
+        // Otherwise, they are reserved, as per 2094-50, and defined as follows:
+        // V1 = Nit99y: scene luminance at 99.99% of the frame
+        // V2 = Dp100f: percentage of pixels <= 100 nits
+        // <https://www.youtube.com/watch?v=n7kOr3vsU50&t=1763s>
+        // V1 is exactly what we use and need for tone-mapping, so plug that in.
+        if (data->dhp->application_version == 1 && n == 9 &&
+            pars->distribution_maxrgb[1].percentage == 5 &&
+            pars->distribution_maxrgb[2].percentage == 10)
+        {
+            const float v1 = av_q2d(pars->distribution_maxrgb[1].percentile);
+            // Reject the V1=0 sentinel. With some small value, values below are
+            // insignificant anyway.
+            if (v1 > 1e-6f) {
+                // V1 is 99.99% of the linearized luminance value for each frame.
+                const float y99_nits = 10000 * v1;
+                out->max_pq_y = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, y99_nits);
+                // There is no scene_avg, but we can infer it by rescaling the
+                // RGB average value, should be good enough approximation.
+                float max = FFMAX3(out->scene_max[0], out->scene_max[1], out->scene_max[2]);
+                if (max > 0 && out->scene_avg) {
+                    const float coef = y99_nits / max;
+                    out->avg_pq_y = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ,
+                                                   coef * out->scene_avg);
+                }
+            }
+        }
 
         if (pars->tone_mapping_flag == 1) {
             out->ootf.target_luma = av_q2d(data->dhp->targeted_system_display_maximum_luminance);
@@ -1089,10 +1116,6 @@ struct pl_avframe_priv {
     pl_tex planar; // for planar vulkan textures
 };
 
-#define COMP_MAX(x, y) ((x) > (y) ? (x) : (y))
-#define COMP_MIN(x, y) ((x) < (y) ? (x) : (y))
-#define COMP_ABS(x) ((x) < 0 ? -(x) : (x))
-
 static void pl_map_hwframe_bit_encoding(struct pl_bit_encoding *out_bits,
                                         enum AVPixelFormat pix_fmt)
 {
@@ -1103,12 +1126,12 @@ static void pl_map_hwframe_bit_encoding(struct pl_bit_encoding *out_bits,
         return;
 
     // Calculate bit encoding from all components (excluding alpha)
-    for (int c = 0; c < COMP_MIN(desc->nb_components, 3); c++) {
+    for (int c = 0; c < FFMIN(desc->nb_components, 3); c++) {
         const AVComponentDescriptor *comp = &desc->comp[c];
         struct pl_bit_encoding cbits = {
-            .sample_depth = comp->depth + COMP_ABS(comp->shift),
+            .sample_depth = comp->depth + FFABS(comp->shift),
             .color_depth  = comp->depth,
-            .bit_shift    = COMP_MAX(comp->shift, 0),
+            .bit_shift    = FFMAX(comp->shift, 0),
         };
 
         if (bits.sample_depth && !pl_bit_encoding_equal(&bits, &cbits)) {
@@ -1122,10 +1145,6 @@ static void pl_map_hwframe_bit_encoding(struct pl_bit_encoding *out_bits,
     if (is_supported)
         *out_bits = bits;
 }
-
-#undef COMP_MAX
-#undef COMP_MIN
-#undef COMP_ABS
 
 static void pl_fix_hwframe_sample_depth(struct pl_frame *out)
 {
