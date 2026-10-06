@@ -794,30 +794,46 @@ fallback:
     pl_shader_sample_direct(sh, src);
 }
 
+// also clamps to the range implied by `repr`, for non-float formats
 static void swizzle_color(pl_shader sh, int comps, const int comp_map[4],
-                          bool force_alpha)
+                          bool force_alpha, const struct pl_color_repr *repr,
+                          pl_fmt fmt)
 {
     ident_t orig = sh_fresh(sh, "orig_color");
     GLSL("vec4 "$" = color;                 \n"
          "color = vec4(0.0, 0.0, 0.0, 1.0); \n", orig);
 
+    // Floating point formats have no representable range to clamp to, and
+    // legitimately carry values outside of [0, 1] (e.g. scRGB, linear XYZ)
+    const bool clamp = fmt->type != PL_FMT_FLOAT;
+    float min[4], max[4];
+    pl_color_repr_limits(repr, min, max);
+
     static const int def_map[4] = {0, 1, 2, 3};
     comp_map = PL_DEF(comp_map, def_map);
 
     for (int c = 0; c < comps; c++) {
-        if (comp_map[c] >= 0)
-            GLSL("color[%d] = "$"[%d]; \n", c, orig, comp_map[c]);
+        const int idx = comp_map[c];
+        if (idx < 0)
+            continue;
+        if (clamp) {
+            GLSL("color[%d] = clamp("$"[%d], "$", "$"); \n",
+                 c, orig, idx, SH_FLOAT(min[idx]), SH_FLOAT(max[idx]));
+        } else {
+            GLSL("color[%d] = "$"[%d]; \n", c, orig, idx);
+        }
     }
 
     if (force_alpha)
-        GLSL("color.a = "$".a; \n", orig);
+        GLSL("color.a = clamp("$".a, 0.0, 1.0); \n", orig);
 }
 
 // `scale` adapts from `pass->dst_rect` to the plane being rendered to
 static void draw_overlays(struct pass_state *pass, pl_tex fbo,
                           int comps, const int comp_map[4],
                           const struct pl_overlay *overlays, int num,
-                          struct pl_color_space color, struct pl_color_repr repr,
+                          struct pl_color_space color,
+                          const struct pl_color_repr repr,
                           const pl_transform2x2 *output_shift)
 {
     pl_renderer rr = pass->rr;
@@ -997,7 +1013,7 @@ static void draw_overlays(struct pass_state *pass, pl_tex fbo,
                  premul ? "rgba" : "a", tex);
         }
 
-        swizzle_color(sh, comps, comp_map, true);
+        swizzle_color(sh, comps, comp_map, true, &repr, fbo->params.format);
 
         struct pl_blend_params blend_params = {
             .src_rgb = premul ? PL_BLEND_ONE : PL_BLEND_SRC_ALPHA,
@@ -1212,8 +1228,9 @@ static void hdr_update_peak(struct pass_state *pass)
     if (max_peak <= pass->target.color.hdr.max_luma + 1e-6)
         goto cleanup; // no adaptation needed
 
-    if (pass->img.color.hdr.avg_pq_y)
-        goto cleanup; // DV metadata already present
+    if (pl_hdr_metadata_contains(&pass->img.color.hdr, PL_HDR_METADATA_HDR10PLUS) &&
+        pl_hdr_metadata_contains(&pass->img.color.hdr, PL_HDR_METADATA_CIE_Y))
+        goto cleanup; // metadata already present
 
     enum pl_hdr_metadata_type metadata = PL_HDR_METADATA_ANY;
     if (params->color_map_params)
@@ -2675,7 +2692,8 @@ static void clear_target(struct pass_state *pass, const pl_tex background,
                  SH_FLOAT(bg_scale));
 
             swizzle_color(sh, plane->components, plane->component_mapping,
-                          params->blend_params);
+                          params->blend_params, &target->repr,
+                          plane->texture->params.format);
 
             pl_dispatch_finish(rr->dp, pl_dispatch_params(
                 .shader         = &sh,
@@ -2711,6 +2729,11 @@ static void translate_srgb_color(float out_color[3], const float in_color[3],
         srgb.hdr.min_luma = PL_COLOR_HDR_BLACK;
         break;
     }
+
+    // The colors are display-referred, so on SDR targets map sRGB white onto
+    // the target white, regardless of the target's absolute luminance
+    if (!pl_color_transfer_is_hdr(csp->transfer))
+        srgb.hdr.max_luma = csp->hdr.max_luma;
 
     memcpy(out_color, in_color, sizeof(float[3]));
     pl_color_linearize(&srgb, out_color);
@@ -3055,25 +3078,27 @@ static bool pass_output_target(struct pass_state *pass)
             rr->prev_dither = applied_dither;
         }
 
-        const char *comps = params->blend_params ? "rgb" : "rgba";
-        const int num_comps = params->blend_params ? 3 : 4;
-        const int bit_shift = target->repr.bits.bit_shift;
+        enum pl_fmt_type type = plane->texture->params.format->type;
         const int sample_depth = PL_DEF(target->repr.bits.sample_depth,
                                         target->repr.bits.color_depth);
-        // Snap MSB-aligned formats (e.g. P010) to the sample grid, so the unused
-        // low bits are zero instead of carrying sub-LSB error.
-        if (bit_shift > 0 && bit_shift < sample_depth) {
-            const float grid = ((1ull << sample_depth) - 1) /
-                               (float) (1ull << bit_shift);
+
+        if (sample_depth && type != PL_FMT_FLOAT) {
+            const char *comps = params->blend_params ? "rgb" : "rgba";
+            const int bit_shift = target->repr.bits.bit_shift;
+
+            // Snap MSB-aligned formats (e.g. P010) to the sample grid, so the unused
+            // low bits are zero instead of carrying sub-LSB error. Note that
+            // SNORM normalizes to [-1, 1], so we subtract one bit
+            const bool snorm = plane->texture->params.format->type == PL_FMT_SNORM;
+            const float grid = ((1ull << (sample_depth - snorm)) - 1) /
+                                (float) (1ull << bit_shift);
             GLSL("color.%s = round(color.%s * "$") * "$"; \n",
                  comps, comps, SH_FLOAT(grid / scale), SH_FLOAT(1.0f / grid));
-        } else {
-            GLSL("color.%s *= vec%d(1.0 / "$"); \n",
-                 comps, num_comps, SH_FLOAT(scale));
         }
 
         swizzle_color(sh, plane->components, plane->component_mapping,
-                      params->blend_params);
+                      params->blend_params, &target->repr,
+                      plane->texture->params.format);
 
         pl_rect2d plane_rect = {
             .x0 = flipped_x ? rx1 : rx0,
