@@ -215,9 +215,9 @@ static void pl_test_roundtrip(pl_gpu gpu, pl_tex tex[2],
         REQUIRE_MEMEQ(src, dst, bytes);
     }
 
-    // Report timer results
-    printf("upload time: %"PRIu64", download time: %"PRIu64"\n",
-           pl_timer_query(gpu, ul), pl_timer_query(gpu, dl));
+    // Exercise timer queries
+    (void) pl_timer_query(gpu, ul);
+    (void) pl_timer_query(gpu, dl);
 
     pl_timer_destroy(gpu, &ul);
     pl_timer_destroy(gpu, &dl);
@@ -250,7 +250,6 @@ void pl_texture_tests(pl_gpu gpu)
         pl_tex tex[2];
 
         if (gpu->limits.max_tex_1d_dim >= 16) {
-            printf("-- 1D\n");
             struct pl_tex_params params = ref_params;
             params.w = 16;
             if (!gpu->limits.blittable_1d_3d)
@@ -263,7 +262,6 @@ void pl_texture_tests(pl_gpu gpu)
         }
 
         if (gpu->limits.max_tex_2d_dim >= 16) {
-            printf("-- 2D\n");
             struct pl_tex_params params = ref_params;
             params.w = params.h = 16;
             for (int i = 0; i < PL_ARRAY_SIZE(tex); i++)
@@ -274,7 +272,6 @@ void pl_texture_tests(pl_gpu gpu)
         }
 
         if (gpu->limits.max_tex_3d_dim >= 16) {
-            printf("-- 3D\n");
             struct pl_tex_params params = ref_params;
             params.w = params.h = params.d = 16;
             if (!gpu->limits.blittable_1d_3d)
@@ -703,6 +700,23 @@ static void pl_shader_tests(pl_gpu gpu)
 
         TEST_FBO_PATTERN(epsilon, "color system: %s", pl_color_system_name(sys));
     }
+
+    // XYZ roundtrip through explicit (non-default) primaries
+    sh = pl_dispatch_begin(dp);
+    pl_shader_sample_nearest(sh, pl_sample_src( .tex = src ));
+    pl_shader_encode_color_ex(sh, pl_color_encode_args(
+        .repr       = &(struct pl_color_repr) { .sys = PL_COLOR_SYSTEM_XYZ },
+        .primaries  = PL_COLOR_PRIM_BT_2020,
+    ));
+    pl_shader_decode_color_ex(sh, pl_color_decode_args(
+        .repr       = &(struct pl_color_repr) { .sys = PL_COLOR_SYSTEM_XYZ },
+        .primaries  = PL_COLOR_PRIM_BT_2020,
+    ));
+    REQUIRE(pl_dispatch_finish(dp, &(struct pl_dispatch_params) {
+        .shader = &sh,
+        .target = fbo,
+    }));
+    TEST_FBO_PATTERN(1e-5, "%s", "color system: XYZ (BT.2020 primaries)");
 
     // Repeat this a few times to test the caching
     pl_cache cache = pl_cache_create(pl_cache_params( .log = gpu->log ));
