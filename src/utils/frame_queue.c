@@ -61,6 +61,9 @@ struct entry {
 // Maximum number of not-yet-mapped frames to allow queueing in advance
 #define PREFETCH_FRAMES 2
 
+// Epsilon for comparing PTS values against derived the EOF timestamp.
+#define PTS_EPS 1e-6
+
 struct pool {
     double samples[MAX_SAMPLES];
     double estimate;
@@ -90,8 +93,8 @@ struct pl_queue_t {
     PL_ARRAY(struct entry *) queue;
     uint64_t signature;
     int threshold_frames;
-    bool want_frame;
-    bool eof;
+    int total_fields; // source fields ever seen
+    enum pl_queue_status status;
 
     // Average vsync/frame fps estimation state
     struct pool vps, fps;
@@ -122,6 +125,9 @@ pl_queue pl_queue_create(pl_gpu gpu)
     int ret = pl_cond_init(&p->wakeup);
     if (ret) {
         PL_ERR(p, "Failed to init conditional variable: %d", ret);
+        pl_mutex_destroy(&p->lock_weak);
+        pl_mutex_destroy(&p->lock_strong);
+        pl_free(p);
         return NULL;
     }
     return p;
@@ -214,6 +220,10 @@ void pl_queue_reset(pl_queue p)
 
     for (int i = 0; i < p->queue.num; i++)
         entry_cull(p, p->queue.elem[i], false);
+    for (int n = 0; n < p->cache.num; n++) {
+        for (int i = 0; i < PL_ARRAY_SIZE(p->cache.elem[n].tex); i++)
+            pl_tex_destroy(p->gpu, &p->cache.elem[n].tex[i]);
+    }
 
     *p = (struct pl_queue_t) {
         .gpu = p->gpu,
@@ -229,9 +239,7 @@ void pl_queue_reset(pl_queue p)
         .tmp_sig.elem = p->tmp_sig.elem,
         .tmp_ts.elem = p->tmp_ts.elem,
         .tmp_frame.elem = p->tmp_frame.elem,
-
-        // Reuse GPU object cache entirely
-        .cache = p->cache,
+        .cache.elem = p->cache.elem,
     };
 
     pl_cond_signal(&p->wakeup);
@@ -275,10 +283,10 @@ static inline void update_estimate(struct pool *pool, double cur)
 
 static void queue_push(pl_queue p, const struct pl_source_frame *src)
 {
-    if (p->eof && !src)
-        return; // ignore duplicate EOF
+    if (!src && (p->status == PL_QUEUE_EOF || p->status == PL_QUEUE_ERR))
+        return; // ignore duplicate EOF, or EOF after error
 
-    if (p->eof && src) {
+    if (p->status == PL_QUEUE_EOF && src) {
         PL_INFO(p, "Received frame after EOF signaled... discarding frame!");
         if (src->discard)
             src->discard(src);
@@ -289,8 +297,7 @@ static void queue_push(pl_queue p, const struct pl_source_frame *src)
 
     if (!src) {
         PL_TRACE(p, "Received EOF, draining frame queue...");
-        p->eof = true;
-        p->want_frame = false;
+        p->status = PL_QUEUE_EOF;
 
         const struct entry *last = p->queue.num ? p->queue.elem[p->queue.num - 1] : NULL;
         if (last && last->defer_second_field) {
@@ -331,15 +338,16 @@ static void queue_push(pl_queue p, const struct pl_source_frame *src)
     PL_TRACE(p, "Added new frame id %"PRIu64" with PTS %f",
              entry->signature, entry->pts);
 
+    const bool interlaced = src->first_field != PL_FIELD_NONE;
+    p->total_fields += interlaced ? 2 : 1;
+
     // Insert new entry into the correct spot in the queue, sorted by PTS
     for (int i = p->queue.num;; i--) {
         if (i == 0 || p->queue.elem[i - 1]->pts <= entry->pts) {
-            if (src->first_field == PL_FIELD_NONE) {
-                // Progressive
+            if (!interlaced) {
                 PL_ARRAY_INSERT_AT(p, p->queue, i, entry);
                 break;
             } else {
-                // Interlaced
                 struct entry *prev = i > 0 ? p->queue.elem[i - 1] : NULL;
                 struct entry *next = i < p->queue.num ? p->queue.elem[i] : NULL;
                 if (prev && prev->defer_second_field) {
@@ -427,13 +435,45 @@ static void queue_push(pl_queue p, const struct pl_source_frame *src)
         }
     }
 
-    p->want_frame = false;
+    if (p->status == PL_QUEUE_MORE)
+        p->status = PL_QUEUE_OK;
 }
 
 void pl_queue_push(pl_queue p, const struct pl_source_frame *frame)
 {
     pl_mutex_lock(&p->lock_weak);
     queue_push(p, frame);
+    pl_mutex_unlock(&p->lock_weak);
+}
+
+enum pl_queue_status pl_queue_get_status(pl_queue p)
+{
+    pl_mutex_lock(&p->lock_weak);
+    enum pl_queue_status status = p->status;
+    pl_mutex_unlock(&p->lock_weak);
+    return status;
+}
+
+void pl_queue_set_status(pl_queue p, enum pl_queue_status status)
+{
+    pl_mutex_lock(&p->lock_weak);
+    if (status == p->status) {
+        pl_mutex_unlock(&p->lock_weak);
+        return;
+    }
+
+    switch (status) {
+    case PL_QUEUE_OK:
+    case PL_QUEUE_MORE:
+    case PL_QUEUE_ERR:
+        p->status = status;
+        break;
+    case PL_QUEUE_EOF:
+        queue_push(p, NULL);
+        break;
+    }
+
+    pl_cond_broadcast(&p->wakeup);
     pl_mutex_unlock(&p->lock_weak);
 }
 
@@ -444,7 +484,7 @@ static inline bool entry_mapped(struct entry *entry)
 
 static bool queue_has_room(pl_queue p)
 {
-    if (p->want_frame)
+    if (p->status == PL_QUEUE_MORE)
         return true;
 
     int wanted_frames = PREFETCH_FRAMES;
@@ -466,10 +506,13 @@ bool pl_queue_push_block(pl_queue p, uint64_t timeout,
                          const struct pl_source_frame *frame)
 {
     pl_mutex_lock(&p->lock_weak);
-    if (!timeout || !frame || p->eof)
+    if (!timeout || !frame || p->status == PL_QUEUE_EOF ||
+        p->status == PL_QUEUE_ERR)
         goto skip_blocking;
 
-    while (!queue_has_room(p) && !p->eof) {
+    while (!queue_has_room(p) && p->status != PL_QUEUE_EOF &&
+           p->status != PL_QUEUE_ERR)
+    {
         if (pl_cond_timedwait(&p->wakeup, &p->lock_weak, timeout) == ETIMEDOUT) {
             pl_mutex_unlock(&p->lock_weak);
             return false;
@@ -507,22 +550,22 @@ static void report_estimates(pl_queue p)
 // note: may add more than one frame, since it releases the lock
 static enum pl_queue_status get_frame(pl_queue p, const struct pl_queue_params *params)
 {
-    if (p->eof)
-        return PL_QUEUE_EOF;
+    if (p->status == PL_QUEUE_EOF || p->status == PL_QUEUE_ERR)
+        return p->status;
 
     if (!params->get_frame) {
         if (!params->timeout)
             return PL_QUEUE_MORE;
 
-        p->want_frame = true;
+        p->status = PL_QUEUE_MORE;
         pl_cond_signal(&p->wakeup);
 
-        while (p->want_frame) {
+        while (p->status == PL_QUEUE_MORE) {
             if (pl_cond_timedwait(&p->wakeup, &p->lock_weak, params->timeout) == ETIMEDOUT)
                 return PL_QUEUE_MORE;
         }
 
-        return p->eof ? PL_QUEUE_EOF : PL_QUEUE_OK;
+        return p->status;
     }
 
     // Don't hold the weak mutex while calling into `get_frame`, to allow
@@ -590,7 +633,7 @@ static bool map_entry(pl_queue p, struct entry *entry)
 static bool entry_complete(pl_queue p, struct entry *entry)
 {
     pl_assert(!(entry->next && entry->defer_second_field));
-    return entry->field ? (entry->next || p->eof) : true;
+    return entry->field ? (entry->next || p->status == PL_QUEUE_EOF) : true;
 }
 
 // Advance the queue as needed to make sure idx 0 is the last frame before
@@ -644,7 +687,7 @@ retry: ;
     }
 
 done:
-    if (p->eof && p->queue.num == 1) {
+    if (p->status == PL_QUEUE_EOF && p->queue.num == 1) {
         if (p->queue.elem[0]->pts == 0.0 || !p->fps.estimate) {
             // If the last frame has PTS 0.0, or we have no FPS estimate, then
             // this is probably a single-frame file, in which case we want to
@@ -655,7 +698,7 @@ done:
 
         // Last frame is held for an extra `p->fps.estimate` duration,
         // afterwards this function just returns EOF.
-        if (pts < p->queue.elem[0]->pts + p->fps.estimate) {
+        if (pts + PTS_EPS < p->queue.elem[0]->pts + p->fps.estimate) {
             ret = PL_QUEUE_OK;
         } else {
             entry_cull(p, p->queue.elem[0], true);
@@ -759,7 +802,7 @@ static enum pl_queue_status oversample(pl_queue p, struct pl_frame_mix *mix,
     }
 
     if (!mix)
-        return PL_QUEUE_OK;
+        return ret;
 
     // Can't oversample with only a single frame, fall back to point sampling
     if (p->queue.num < 2 || p->queue.elem[0]->pts > params->pts) {
@@ -871,7 +914,8 @@ static enum pl_queue_status interpolate(pl_queue p, struct pl_frame_mix *mix,
             // Don't forward EOF until we've held the last frame for the
             // desired ZOH hold duration
             double last_pts = p->queue.elem[p->queue.num - 1]->pts;
-            if (last_pts && params->pts >= last_pts + p->fps.estimate)
+            bool still_frame = p->total_fields <= 1;
+            if (params->pts + PTS_EPS >= last_pts + p->fps.estimate && !still_frame)
                 return ret;
             ret = PL_QUEUE_OK;
             goto done;
@@ -899,7 +943,7 @@ static enum pl_queue_status interpolate(pl_queue p, struct pl_frame_mix *mix,
 done: ;
 
     if (!mix)
-        return PL_QUEUE_OK;
+        return ret;
 
     // Construct a mix object representing the current queue state, starting at
     // the last frame before `min_pts` to make sure there's a fallback frame

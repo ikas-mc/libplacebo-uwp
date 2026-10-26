@@ -70,7 +70,8 @@ static void vk_cmd_destroy(struct vk_cmd *cmd)
         return;
 
     struct vk_ctx *vk = cmd->pool->vk;
-    vk_cmd_poll(cmd, UINT64_MAX);
+    if (cmd->sync.sem || cmd->fence)
+        vk_cmd_poll(cmd, UINT64_MAX);
     vk_cmd_reset(cmd);
     vk->DestroyFence(vk->dev, cmd->fence, PL_VK_ALLOC);
     vk->FreeCommandBuffers(vk->dev, cmd->pool->pool, 1, &cmd->buf);
@@ -263,10 +264,11 @@ struct vk_sync_scope vk_sem_barrier(struct vk_cmd *cmd, struct vk_sem *sem,
         last = sem->read;
 
     if (last.queue != cmd->queue) {
-        if (!is_write && sem->read.queue == cmd->queue) {
-            // No semaphore needed in this case because the implicit submission
-            // order execution dependencies already transitively imply a wait
-            // for the previous write
+        if (!is_write && sem->read.queue == cmd->queue &&
+            (sem->read.stage & stage) == stage)
+        {
+            // A previous semaphore wait on this queue already covers these stages
+            // and all following accesses in the same stages.
         } else if (last.sync.sem) {
             // Image barrier still needs to depend on this stage for implicit
             // ordering guarantees to apply properly. A synchronization point
