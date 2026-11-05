@@ -434,7 +434,7 @@ void pl_shader_decode_color_ex(pl_shader sh,
         // work here even though we will end up linearizing later on anyway)
 
         GLSL(// PQ EOTF
-             "color.rgb = pow(max(color.rgb, 0.0), vec3(1.0/%f));           \n"
+             "color.rgb = pow(clamp(color.rgb, 0.0, 1.0), vec3(1.0/%f));    \n"
              "color.rgb = max(color.rgb - vec3(%f), 0.0)                    \n"
              "             / (vec3(%f) - vec3(%f) * color.rgb);             \n"
              "color.rgb = pow(color.rgb, vec3(1.0/%f));                     \n"
@@ -588,7 +588,7 @@ void pl_shader_encode_color_ex(pl_shader sh, const struct pl_color_encode_args *
         break;
 
     case PL_COLOR_SYSTEM_BT_2100_PQ:;
-        GLSL("color.rgb = pow(max(color.rgb, 0.0), vec3(1.0/%f));           \n"
+        GLSL("color.rgb = pow(clamp(color.rgb, 0.0, 1.0), vec3(1.0/%f));    \n"
              "color.rgb = max(color.rgb - vec3(%f), 0.0)                    \n"
              "             / (vec3(%f) - vec3(%f) * color.rgb);             \n"
              "color.rgb = pow(color.rgb, vec3(1.0/%f));                     \n"
@@ -844,9 +844,8 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
         csp->transfer != PL_COLOR_TRC_HLG &&
         (csp_max != 1 || csp_min != 0))
     {
-        GLSL("color.rgb = "$" * color.rgb + vec3("$"); \n",
-             SH_FLOAT(1 / (csp_max - csp_min)),
-             SH_FLOAT(-csp_min / (csp_max - csp_min)));
+        GLSL("color.rgb = "$" * (color.rgb - vec3("$")); \n",
+             SH_FLOAT(1 / (csp_max - csp_min)), SH_FLOAT(csp_min));
     }
 
     if (csp->transfer != PL_COLOR_TRC_SCRGB)
