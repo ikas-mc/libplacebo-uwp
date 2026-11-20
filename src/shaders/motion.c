@@ -52,68 +52,45 @@ static int dir_index(enum pl_motion_direction dir)
 
 // Persistent state and scratch space behind a PL_SHADER_OBJ_MOTION shader object.
 struct sh_motion_obj {
-    // --- Persistent across frames
+    // --- Current motion estimation state metadata
+    struct pl_motion_estimate_params params;
 
-    // Signatures of the frame pair the persistent state below describes, i.e.
-    // the ones given to the most recent `pl_motion_estimate` call. `sig_b`
-    // also identifies the frame `pyramid_prev` was built from.
-    uint64_t sig_a, sig_b;
+    // Current frame pair signatures and dimensions
+    uint64_t sig_prev, sig_next;
+    int frame_w, frame_h;
+
+    // Directions and features the state is set up for
+    enum pl_motion_direction direction;
+    enum pl_motion_feature features;
+
+    // Which directions of `dir` are currently valid
+    enum pl_motion_direction valid;
+
+    // --- Outputs for the current frame pair, in each direction
+    struct motion_dir {
+        pl_tex_pyramid coarse; // coarse flow field (blocks), after smoothing
+        pl_tex_pyramid fine;   // fine flow field (pixels), or {0}
+        pl_buf gain;           // brightness gain (float), or NULL
+        pl_tex quality;        // flow quality estimate, or NULL
+        pl_buf global_flow;    // global flow buffer, or NULL
+    } dir[NUM_DIRS];
+
+    // --- Temporary buffers used only within a motion estimation call
+    struct {
+        pl_tex_pyramid input; // Image pyramid of the input features
+        pl_tex_pyramid raw;   // Raw motion vectors (before smoothing)
+        pl_buf hist;          // Histogram for global motion estimation
+    } scratch;
+
+    // --- Other cached / persistent GPU objects
+
+    // LUTs for the motion search candidate ordering
+    pl_shader_obj cand_lut[2];
 
     // Luma pyramid of the *previous* call's frame `b`, reused as this call's
     // frame `a` pyramid. Only holds a usable pyramid if `pyramid_valid`.
     pl_tex_pyramid pyramid_prev;
     bool pyramid_valid;
-
-    // Block granular flow fields from each level of the image pyramid
-    // searched by the most recent motion estimation invocation. Used to seed
-    // the next motion estimation search.
-    struct {
-        pl_tex_pyramid field[NUM_DIRS]; // indexed by dir_index()
-        pl_tex_pyramid fine[NUM_DIRS];  // likewise, see refine_plan()
-        enum pl_motion_direction valid; // directions actually computed
-    } flow;
-
-    // Dimensions of `flow.field[FWD].elem[0]` (number of blocks to cover the
-    // full resolution).
-    int grid_w, grid_h;
-
-    // Global motion of each direction, as an SSBO laid out as
-    // `global_buf_data`. Not allocated until `input->estimate_global` is set.
-    // One per direction, like `flow.field`. `valid` determines if they hold
-    // the global motion of the directions in `flow.valid`. `hist` is scratch
-    // for computation.
-    struct {
-        pl_buf buf[NUM_DIRS];
-        pl_buf hist;
-        bool valid;
-    } global;
-
-    // Change in brightness between the frames, see `motion_gain_pass`. One
-    // for the forward and one for the backward direction.
-    pl_tex gain[NUM_DIRS];
-
-    // Quality of the vectors of the forward and of the backward flow field,
-    // see `motion_quality_pass`. Only holds that of the directions in
-    // `flow.valid`, and only if `quality_valid`.
-    struct {
-        pl_tex field[2];
-        bool valid;
-    } quality;
-
-    // LUTs for the search candidate ordering.
-    // `cand_lut[0]` holds the fine search radius LUT and `cand_lut[1]` holds
-    // the coarse one.
-    pl_shader_obj cand_lut[2];
-
-    // --- Valid only for the duration of one pl_motion_estimate call
-    struct {
-        pl_tex_pyramid levels; // luma pyramid of this call's frame `b`
-        pl_tex_pyramid raw;    // per-level search output
-        pl_tex_pyramid filtered; // per-level search output after smoothing
-    } scratch;
-
-    struct pl_motion_estimate_params params;
-    int w, h;
 };
 
 // Binds `tex` for use with `texelFetch`.
@@ -447,12 +424,17 @@ static void cand_fill(int radius, int *out)
 
 // Selects an appropriate shader geometry (grid and workgroup dimensions) for
 // the motion estimation. Iteratively reduces the tile size that each workgroup
-// will process until a size is found that fits in shared memory.
-static bool motion_plan(pl_gpu gpu, void *alloc, int block_size, int radius,
-                        struct motion_seeds seeds, bool subpixel,
-                        bool zero_mean, int grid_w, int grid_h,
+// will process until a size is found that fits in shared memory. `coarsest`
+// selects the search radius of the coarsest pyramid level.
+static bool motion_plan(pl_gpu gpu, void *alloc,
+                        const struct pl_motion_estimate_params *params,
+                        bool coarsest, struct motion_seeds seeds,
+                        bool subpixel, bool zero_mean, int grid_w, int grid_h,
                         struct motion_geometry *out)
 {
+    const int block_size = params->block_size_coarse;
+    const int radius = coarsest ? params->search_radius_coarse
+                                : params->search_radius_fine;
     const int ncand = PL_SQUARE(2 * radius + 1);
     const int max_group = gpu->glsl.max_group_threads;
     const int max_x =
@@ -558,17 +540,16 @@ static void motion_uninit(pl_gpu gpu, void *ptr)
 {
     struct sh_motion_obj *obj = ptr;
     pl_pyramid_destroy(gpu, &obj->pyramid_prev);
-    pl_pyramid_destroy(gpu, &obj->scratch.levels);
+    pl_pyramid_destroy(gpu, &obj->scratch.input);
     pl_pyramid_destroy(gpu, &obj->scratch.raw);
-    pl_pyramid_destroy(gpu, &obj->scratch.filtered);
     for (int i = 0; i < NUM_DIRS; i++) {
-        pl_pyramid_destroy(gpu, &obj->flow.field[i]);
-        pl_pyramid_destroy(gpu, &obj->flow.fine[i]);
-        pl_buf_destroy(gpu, &obj->global.buf[i]);
-        pl_tex_destroy(gpu, &obj->gain[i]);
-        pl_tex_destroy(gpu, &obj->quality.field[i]);
+        pl_pyramid_destroy(gpu, &obj->dir[i].coarse);
+        pl_pyramid_destroy(gpu, &obj->dir[i].fine);
+        pl_buf_destroy(gpu, &obj->dir[i].gain);
+        pl_tex_destroy(gpu, &obj->dir[i].quality);
+        pl_buf_destroy(gpu, &obj->dir[i].global_flow);
     }
-    pl_buf_destroy(gpu, &obj->global.hist);
+    pl_buf_destroy(gpu, &obj->scratch.hist);
     for (int i = 0; i < PL_ARRAY_SIZE(obj->cand_lut); i++)
         pl_shader_obj_destroy(&obj->cand_lut[i]);
     memset(obj, 0, sizeof(*obj));
@@ -581,15 +562,9 @@ static void invalidate_temporal(pl_gpu gpu, struct sh_motion_obj *obj,
 {
     PL_DEBUG(gpu, "pl_motion: discarding temporal state: %s", reason);
 
-    obj->sig_a = obj->sig_b = 0;
-    obj->flow.valid = 0;
-    obj->global.valid = false;
-    obj->quality.valid = false;
+    obj->sig_prev = obj->sig_next = 0;
+    obj->valid = 0;
     obj->pyramid_valid = false;
-
-    for (int i = 0; i < NUM_DIRS; i++)
-        pl_buf_destroy(gpu, &obj->global.buf[i]);
-    pl_buf_destroy(gpu, &obj->global.hist);
 }
 
 int pl_motion_num_blocks(int w, int h,
@@ -619,11 +594,11 @@ pl_tex pl_motion_get_flow(pl_shader_obj state, enum pl_motion_direction dir)
                                               struct sh_motion_obj);
     // `dir` cannot name `PL_MOTION_BOTH`, we can only return one flow field.
     const int d = dir_index(dir);
-    if (!obj || d < 0 || !(obj->flow.valid & dir))
+    if (!obj || d < 0 || !(obj->valid & dir))
         return NULL;
 
-    const pl_tex_pyramid *fine = &obj->flow.fine[d];
-    return fine->num ? fine->elem[0] : obj->flow.field[d].elem[0];
+    const pl_tex_pyramid *fine = &obj->dir[d].fine;
+    return fine->num ? fine->elem[0] : obj->dir[d].coarse.elem[0];
 }
 
 pl_tex pl_motion_get_quality(pl_shader_obj state, enum pl_motion_direction dir)
@@ -631,10 +606,11 @@ pl_tex pl_motion_get_quality(pl_shader_obj state, enum pl_motion_direction dir)
     struct sh_motion_obj *obj = SH_OBJ_LOOKUP(state, PL_SHADER_OBJ_MOTION,
                                               struct sh_motion_obj);
     const int d = dir_index(dir);
-    if (!obj || d < 0 || !obj->quality.valid || !(obj->flow.valid & dir))
+    if (!obj || d < 0 || !(obj->features & PL_MOTION_QUALITY) ||
+        !(obj->valid & dir))
         return NULL;
 
-    return obj->quality.field[d];
+    return obj->dir[d].quality;
 }
 
 ident_t sh_motion_flow(pl_shader sh, pl_shader_obj state,
@@ -655,10 +631,11 @@ pl_buf pl_motion_get_global_buf(pl_shader_obj state,
     // `dir` cannot name `PL_MOTION_BOTH`, we can only return one global
     // motion vector.
     const int d = dir_index(dir);
-    if (!obj || d < 0 || !obj->global.valid || !(obj->flow.valid & dir))
+    if (!obj || d < 0 || !(obj->features & PL_MOTION_GLOBAL) ||
+        !(obj->valid & dir))
         return NULL;
 
-    return obj->global.buf[d];
+    return obj->dir[d].global_flow;
 }
 
 struct global_buf_data {
@@ -666,9 +643,10 @@ struct global_buf_data {
     float global_confidence;
 };
 
-const struct pl_buffer_var
-    pl_motion_global_buf_vars[PL_MOTION_BACKWARD + 1]
-                             [PL_MOTION_GLOBAL_BUF_NUM_VARS] = {
+// Names differ per direction, so that both can be bound to one shader
+#define GLOBAL_BUF_NUM_VARS 2
+static const struct pl_buffer_var
+    global_buf_vars[PL_MOTION_BACKWARD + 1][GLOBAL_BUF_NUM_VARS] = {
 #define VAR(field, suffix, dim) {                                               \
     .var = {                                                                    \
         .name = #field "_" #suffix,                                             \
@@ -705,7 +683,7 @@ ident_t sh_motion_global(pl_shader sh, pl_shader_obj state,
     pl_assert(global->params.size >= sizeof(struct global_buf_data));
 
     bind_buf(sh, "global_motion_desc", global, PL_DESC_ACCESS_READONLY,
-             pl_motion_global_buf_vars[dir], PL_MOTION_GLOBAL_BUF_NUM_VARS);
+             global_buf_vars[dir], GLOBAL_BUF_NUM_VARS);
 
     ident_t gm = sh_fresh(sh, "global_motion");
     // clang-format off
@@ -829,6 +807,18 @@ static bool validate(pl_gpu gpu, const struct pl_motion_estimate_input *input,
     return true;
 }
 
+static void fix_params(struct pl_motion_estimate_params *params)
+{
+    // Round to actually support refinement block sizes
+    if (params->block_size_fine <= 1) {
+        params->block_size_fine = 1;
+    } else if (params->block_size_fine <= 4 && params->block_size_coarse > 4) {
+        params->block_size_fine = 4;
+    } else {
+        params->block_size_fine = params->block_size_coarse;
+    }
+}
+
 // Convert an input frame to luma.
 static bool convert_to_luma(pl_dispatch dispatch,
                             const struct pl_motion_estimate_frame *frame,
@@ -858,14 +848,30 @@ static bool convert_to_luma(pl_dispatch dispatch,
     ));
 }
 
+// Layout of the gain buffer, see `motion_gain_pass`
+static const struct pl_buffer_var gain_var = {
+    .var = {
+        .name  = "motion_gain",
+        .type  = PL_VAR_FLOAT,
+        .dim_v = 1,
+        .dim_m = 1,
+        .dim_a = 1,
+    },
+    .layout = {
+        .offset = 0,
+        .size   = sizeof(float),
+        .stride = sizeof(float),
+    },
+};
+
 // Returns the (float) gain factor needed to compensate for brightness changes
 // between the target and the reference frame.
-static ident_t get_target_gain(pl_shader sh, pl_tex gain_tex)
+static ident_t get_target_gain(pl_shader sh, pl_buf gain_buf)
 {
     ident_t gain = sh_fresh(sh, "gain");
-    if (gain_tex) {
-        ident_t tex = bind_tex(sh, "gain_tex", gain_tex);
-        GLSL("float "$" = texelFetch("$", ivec2(0), 0).x;", gain, tex);
+    if (gain_buf) {
+        bind_buf(sh, "gain_buf", gain_buf, PL_DESC_ACCESS_READONLY, &gain_var, 1);
+        GLSL("float "$" = motion_gain;", gain);
     } else {
         GLSL("float "$" = 1.0;", gain);
     }
@@ -874,7 +880,7 @@ static ident_t get_target_gain(pl_shader sh, pl_tex gain_tex)
 }
 
 // Measures the change in brightness from `ref` to `tgt`, as on a fade, into
-// the 1x1 texture `gain`: the factor that brings `tgt` to the brightness of
+// the buffer `gain`: the factor that brings `tgt` to the brightness of
 // `ref`. It is the ratio of the mean luma of the blocks of `ref` to that of
 // the blocks in `tgt` that their vectors in `flow` lead to.
 //
@@ -883,9 +889,11 @@ static ident_t get_target_gain(pl_shader sh, pl_tex gain_tex)
 // a change in brightness. For the same reason, blocks whose vectors leave the
 // frame are skipped, and the others are weighted by how well their textures
 // match once their means are removed.
-static bool motion_gain_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
-                             pl_tex ref, pl_tex tgt, pl_tex flow, pl_tex gain)
+static bool motion_gain_pass(pl_gpu gpu, pl_dispatch dispatch,
+                             const struct pl_motion_estimate_params *params,
+                             pl_tex ref, pl_tex tgt, pl_tex flow, pl_buf gain)
 {
+    const int bs = params->block_size_coarse;
     const int tex_w = ref->params.w, tex_h = ref->params.h;
     const int grid_w = flow->params.w, grid_h = flow->params.h;
     const int threads = 64;
@@ -904,7 +912,7 @@ static bool motion_gain_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
 
     ident_t ref_id  = bind_tex(sh, "ref", ref);
     ident_t flow_id = bind_tex(sh, "flow", flow);
-    ident_t gain_id = bind_img(sh, "gain", gain);
+    bind_buf(sh, "gain_out", gain, PL_DESC_ACCESS_WRITEONLY, &gain_var, 1);
     ident_t tgt_id  = bind_tex_linear(sh, "tgt", tgt, NULL, NULL);
     if (!tgt_id) {
         pl_dispatch_abort(dispatch, &sh);
@@ -962,7 +970,7 @@ static bool motion_gain_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
         float change = sum.x / max(sum.y, 1e-6) - 1.0;                          \
         change = sign(change) *                                                 \
                  max(abs(change) - ${const float: MOTION_GAIN_DEADZONE}, 0.0);  \
-        imageStore($gain_id, ivec2(0), vec4(1.0 + change));                     \
+        motion_gain = 1.0 + change;                                             \
     }
     // clang-format on
 
@@ -994,7 +1002,7 @@ struct motion_search {
     pl_tex prior;  // flow field of the same image pyramid level to take the
                    // temporal prior from, or NULL when there is none available
     enum motion_prior prior_kind;
-    pl_tex gain;   // change in brightness from `ref` to `tgt` to compensate
+    pl_buf gain;   // change in brightness from `ref` to `tgt` to compensate
     pl_tex out_mv;                      // block granular flow field
     const struct motion_geometry *geom; // compile time constants
     pl_shader_obj *cand_lut;
@@ -1417,10 +1425,12 @@ error:
 
 // Replace every block's motion vector with one derived from the surrounding 3x3
 // neighbourhood of blocks, to suppress vectors that the search got wrong.
-static bool motion_smooth_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
-                               pl_tex ref, pl_tex tgt, pl_tex gain_tex,
+static bool motion_smooth_pass(pl_gpu gpu, pl_dispatch dispatch,
+                               const struct pl_motion_estimate_params *params,
+                               pl_tex ref, pl_tex tgt, pl_buf gain_buf,
                                pl_tex in, pl_tex out)
 {
+    const int bs = params->block_size_coarse;
     const int grid_w = out->params.w, grid_h = out->params.h;
     const int tex_w = ref->params.w, tex_h = ref->params.h;
 
@@ -1442,7 +1452,7 @@ static bool motion_smooth_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
     ident_t dst = bind_img(sh, "flow_out", out);
     ident_t load_block = sh_tex_load_block(sh, 3, 3, 0x3, tex, &in->params);
     ident_t ref_id = bind_tex(sh, "ref", ref);
-    ident_t gain = get_target_gain(sh, gain_tex);
+    ident_t gain = get_target_gain(sh, gain_buf);
 
     // The vectors are fractional
     ident_t tgt_pt, tgt_id = bind_tex_linear(sh, "tgt", tgt, NULL, &tgt_pt);
@@ -1527,14 +1537,17 @@ error:
 }
 
 // Writes a vector for every 4x4 sub-block of `out`: of the vectors of the 3x3
-// blocks around it in `blocks` (of `bs` pixels squared), and of
-// `MOTION_REFINE_4X4_RINGS` rings of blocks further away, the one that best
+// blocks around it in `blocks` (of `block_size_coarse` pixels squared), and
+// of `MOTION_REFINE_4X4_RINGS` rings of blocks further away, the one that best
 // matches the sub-block and a border of one pixel around it. The vector of the
 // sub-block's own block is preferred by a margin of one code value (8 bit).
-static bool motion_refine_4x4_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
-                                   pl_tex ref, pl_tex tgt, pl_tex gain_tex,
-                                   pl_tex blocks, pl_tex out)
+static bool
+motion_refine_4x4_pass(pl_gpu gpu, pl_dispatch dispatch,
+                       const struct pl_motion_estimate_params *params,
+                       pl_tex ref, pl_tex tgt, pl_buf gain_buf, pl_tex blocks,
+                       pl_tex out)
 {
+    const int bs = params->block_size_coarse;
     const int w = ref->params.w, h = ref->params.h;
     const int grid_w = blocks->params.w, grid_h = blocks->params.h;
     const int sub_w = out->params.w, sub_h = out->params.h;
@@ -1554,7 +1567,7 @@ static bool motion_refine_4x4_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
     ident_t load_block = sh_tex_load_block(sh, win, win, 0x1, ref_id,
                                            &ref->params);
     ident_t block_ssd = sh_block_ssd(sh, win, win, 0, tgt_id, &tgt->params);
-    ident_t gain = get_target_gain(sh, gain_tex);
+    ident_t gain = get_target_gain(sh, gain_buf);
 
     // clang-format off
 #pragma GLSL /* motion_refine_4x4_pass */                                       \
@@ -1628,10 +1641,14 @@ static bool motion_refine_4x4_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
 // the vector of the pixel's block in `flow` (of `bs` pixels squared), or that
 // of one of the 8 neighbouring blocks if it matches the 3x3 pixels around the
 // pixel better by more than `MOTION_REFINE_1X1_MARGIN`.
-static bool motion_refine_1x1_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
-                                   pl_tex ref, pl_tex tgt, pl_tex gain_tex,
-                                   pl_tex flow, pl_tex out)
+static bool
+motion_refine_1x1_pass(pl_gpu gpu, pl_dispatch dispatch,
+                       const struct pl_motion_estimate_params *params,
+                       pl_tex ref, pl_tex tgt, pl_buf gain_buf, pl_tex flow,
+                       pl_tex out)
 {
+    // Refines the output of the 4x4 pass, if there is one
+    const int bs = PL_MIN(params->block_size_coarse, 4);
     const int w = out->params.w, h = out->params.h;
     const int grid_w = flow->params.w, grid_h = flow->params.h;
 
@@ -1649,7 +1666,7 @@ static bool motion_refine_1x1_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
     ident_t tgt_id = bind_tex(sh, "tgt", tgt);
     ident_t load_block = sh_tex_load_block(sh, 3, 3, 0x1, ref_id, &ref->params);
     ident_t block_ssd = sh_block_ssd(sh, 3, 3, 0, tgt_id, &tgt->params);
-    ident_t gain = get_target_gain(sh, gain_tex);
+    ident_t gain = get_target_gain(sh, gain_buf);
 
     // clang-format off
 #pragma GLSL /* motion_refine_1x1_pass */                                       \
@@ -1700,6 +1717,13 @@ static bool motion_refine_1x1_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
     ));
 }
 
+// Block size that a refine pass refines blocks of `bs` pixels squared into.
+// Consistent with the passes planned by refine_plan(), from the coarsest.
+static int refine_size(int bs)
+{
+    return bs > 4 ? 4 : 1;
+}
+
 // Returns the number of refine passes needed, and the block size of each
 static int refine_plan(const struct pl_motion_estimate_params *params,
                        int plan[MOTION_MAX_REFINE_PASSES])
@@ -1741,29 +1765,30 @@ static bool refine_pyramid_recreate(pl_gpu gpu, void *alloc,
     return true;
 }
 
-// Refines `blocks`, of `bs` pixels squared, into the levels of `fine`, of the
-// block sizes of `sizes`, from the coarsest.
-static bool refine_flow(pl_gpu gpu, pl_dispatch dispatch, const int sizes[],
-                        pl_tex_pyramid *fine, int bs, pl_tex ref, pl_tex tgt,
-                        pl_tex gain, pl_tex blocks)
+// Refines `blocks` into the levels of `fine`, from the coarsest.
+static bool refine_flow(pl_gpu gpu, pl_dispatch dispatch,
+                        const struct pl_motion_estimate_params *params,
+                        pl_tex_pyramid *fine, pl_tex ref, pl_tex tgt,
+                        pl_buf gain, pl_tex blocks)
 {
     pl_tex in = blocks;
+    int size = params->block_size_coarse;
     for (int i = fine->num - 1; i >= 0; i--) {
-        bool ok = false;
-        switch (sizes[i]) {
-        case 1:
-            ok = motion_refine_1x1_pass(gpu, dispatch, bs, ref, tgt, gain, in,
-                                        fine->elem[i]);
-            break;
+        size = refine_size(size);
+        bool ok;
+        switch (size) {
         case 4:
-            ok = motion_refine_4x4_pass(gpu, dispatch, bs, ref, tgt, gain, in,
-                                        fine->elem[i]);
+            ok = motion_refine_4x4_pass(gpu, dispatch, params, ref, tgt, gain,
+                                        in, fine->elem[i]);
+            break;
+        case 1:
+            ok = motion_refine_1x1_pass(gpu, dispatch, params, ref, tgt, gain,
+                                        in, fine->elem[i]);
             break;
         }
         if (!ok)
             return false;
         in = fine->elem[i];
-        bs = sizes[i];
     }
 
     return true;
@@ -1775,10 +1800,12 @@ static bool refine_flow(pl_gpu gpu, pl_dispatch dispatch, const int sizes[],
 //
 // A mismatch means less the more texture the window has, so it is taken
 // relative to that.
-static bool motion_quality_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
-                                pl_tex ref, pl_tex tgt, pl_tex gain_tex,
+static bool motion_quality_pass(pl_gpu gpu, pl_dispatch dispatch,
+                                const struct pl_motion_estimate_params *params,
+                                pl_tex ref, pl_tex tgt, pl_buf gain_buf,
                                 pl_tex flow, pl_tex out)
 {
+    const int bs = params->block_size_fine;
     const int w = ref->params.w, h = ref->params.h;
     const int out_w = out->params.w, out_h = out->params.h;
     const int sub = MOTION_QUALITY_SUB, win = sub + 2;
@@ -1800,7 +1827,7 @@ static bool motion_quality_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
     ident_t block_ssd = sh_block_ssd(sh, 3, 3, 0, tgt_id, &tgt->params);
     ident_t load_vectors = sh_tex_load_block(sh, 4, 4, 0x3, src, &flow->params);
     ident_t median9 = sh_median(sh, 9, 0x3);
-    ident_t gain = get_target_gain(sh, gain_tex);
+    ident_t gain = get_target_gain(sh, gain_buf);
 
     // clang-format off
 #pragma GLSL /* motion_quality_pass */                                          \
@@ -1897,13 +1924,10 @@ static const struct pl_buffer_var global_hist_var = {
     },
 };
 
-// Reusable helper to recreate global motion and histogram scratch buffers.
-static bool global_buf_recreate(pl_gpu gpu, pl_buf *buf, size_t size,
-                                bool host_readable)
+// Reusable helper to create global motion and histogram scratch buffers.
+static bool global_buf_create(pl_gpu gpu, pl_buf *buf, size_t size,
+                              bool host_readable)
 {
-    if (*buf)
-        return true;
-
     // .initial_data doesn't care if it is larger than .size
     static const uint32_t zero[2 * MOTION_GLOBAL_BINS] = { 0 };
     pl_assert(size <= sizeof(zero));
@@ -1999,7 +2023,7 @@ static bool motion_global_median_pass(pl_gpu gpu, pl_dispatch dispatch,
     bind_buf(sh, "global_hist_buf", hist, PL_DESC_ACCESS_READWRITE,
              &global_hist_var, 1);
     bind_buf(sh, "global_motion_out", out, PL_DESC_ACCESS_WRITEONLY,
-             pl_motion_global_buf_vars[dir], PL_MOTION_GLOBAL_BUF_NUM_VARS);
+             global_buf_vars[dir], GLOBAL_BUF_NUM_VARS);
 
     // clang-format off
 #pragma GLSLH /* motion_global_median_pass */                                   \
@@ -2050,72 +2074,190 @@ static bool estimate_global(pl_gpu gpu, pl_dispatch dispatch,
                             enum pl_motion_direction dir)
 {
     const int d = dir_index(dir);
-    pl_tex flow = obj->flow.field[d].elem[0];
-    pl_buf *global = &obj->global.buf[d];
+    pl_tex flow = obj->dir[d].coarse.elem[0];
+    pl_buf global = obj->dir[d].global_flow;
 
-    return global_buf_recreate(gpu, &obj->global.hist,
-                               2 * MOTION_GLOBAL_BINS * sizeof(uint32_t),
-                               false) &&
-           global_buf_recreate(gpu, global, sizeof(struct global_buf_data),
-                               true) &&
-           motion_global_hist_pass(gpu, dispatch, flow, obj->global.hist) &&
-           motion_global_median_pass(gpu, dispatch, obj->global.hist,
-                                     flow->params.w * flow->params.h, *global,
+    return motion_global_hist_pass(gpu, dispatch, flow, obj->scratch.hist) &&
+           motion_global_median_pass(gpu, dispatch, obj->scratch.hist,
+                                     flow->params.w * flow->params.h, global,
                                      dir);
 }
 
 // Estimates the quality of the vectors of every direction in
-// `obj->flow.valid`, from the luma of the frames they were estimated between.
+// `obj->valid`, from the luma of the frames they were estimated between.
 static bool estimate_quality(pl_gpu gpu, pl_dispatch dispatch,
                              struct sh_motion_obj *obj, pl_tex luma_a,
                              pl_tex luma_b)
 {
-    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 1, 8, 8,
-                             PL_FMT_CAP_STORABLE | PL_FMT_CAP_LINEAR);
-    if (!fmt) {
-        PL_ERR(gpu, "pl_motion_estimate: no storable, linearly filterable "
-                    "single component format available!");
-        return false;
-    }
-
-    int refine[MOTION_MAX_REFINE_PASSES];
-    const int num_refine = refine_plan(&obj->params, refine);
-    const int bs = num_refine ? refine[0] : obj->params.block_size_coarse;
-    const bool has_gain = pyramid_num_levels(obj->w, obj->h, &obj->params) > 1;
-
     for (int d = 0; d < NUM_DIRS; d++) {
         const enum pl_motion_direction dir = 1 << d;
-        if (!(obj->flow.valid & dir))
+        if (!(obj->valid & dir))
             continue;
 
-        const int qw = PL_DIV_UP(obj->w, MOTION_QUALITY_SUB);
-        const int qh = PL_DIV_UP(obj->h, MOTION_QUALITY_SUB);
-        bool ok = pl_tex_recreate(gpu, &obj->quality.field[d], pl_tex_params(
-            .w          = qw,
-            .h          = qh,
-            .format     = fmt,
-            .sampleable = true,
-            .storable   = true,
-        ));
-        if (!ok) {
-            PL_ERR(gpu, "pl_motion_estimate: failed creating %dx%d quality "
-                        "texture!", qw, qh);
-            return false;
-        }
-
         const bool fwd = d == FWD;
-        const pl_tex_pyramid *fine = &obj->flow.fine[d];
-        const pl_tex_pyramid *blocks = &obj->flow.field[d];
-        ok = motion_quality_pass(gpu, dispatch, bs, fwd ? luma_a : luma_b,
-                                 fwd ? luma_b : luma_a,
-                                 has_gain ? obj->gain[d] : NULL,
-                                 num_refine ? fine->elem[0] : blocks->elem[0],
-                                 obj->quality.field[d]);
+        const struct motion_dir *md = &obj->dir[d];
+        bool ok = motion_quality_pass(gpu, dispatch, &obj->params,
+                                      fwd ? luma_a : luma_b,
+                                      fwd ? luma_b : luma_a, md->gain,
+                                      md->fine.num ? md->fine.elem[0]
+                                                   : md->coarse.elem[0],
+                                      md->quality);
         if (!ok)
             return false;
     }
 
     return true;
+}
+
+// Creates all GPU objects needed for this motion estimation call. Whenever the
+// dimensions, parameters, directions or features change, this recreates the
+// entire state from scratch, discarding the temporal state.
+static bool motion_setup(pl_gpu gpu, struct sh_motion_obj *obj, int w, int h,
+                         const struct pl_motion_estimate_params *params,
+                         enum pl_motion_direction direction,
+                         enum pl_motion_feature features)
+{
+    if (w == obj->frame_w && h == obj->frame_h &&
+        direction == obj->direction && features == obj->features &&
+        params_eq(&obj->params, params))
+        return true;
+
+    PL_DEBUG(gpu, "pl_motion: (re)initializing motion state");
+    motion_uninit(gpu, obj);
+    obj->params = *params;
+    obj->frame_w = w;
+    obj->frame_h = h;
+    obj->direction = direction;
+    obj->features = features;
+
+    const int levels = pyramid_num_levels(w, h, params);
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 1, 16, 0,
+                             PL_FMT_CAP_LINEAR | PL_FMT_CAP_RENDERABLE);
+    if (!fmt) {
+        PL_ERR(gpu, "pl_motion_estimate: no renderable, linearly filterable "
+                    "single component float format available!");
+        goto error;
+    }
+
+    pl_fmt mv_fmt = flow_fmt(gpu);
+    if (!mv_fmt) {
+        PL_ERR(gpu, "pl_motion_estimate: no storable, linearly filterable "
+                    "two component float format available!");
+        goto error;
+    }
+
+    // The search covers the trailing partial blocks as well
+    const int grid_w = PL_DIV_UP(w, params->block_size_coarse);
+    const int grid_h = PL_DIV_UP(h, params->block_size_coarse);
+
+    const struct pl_tex_params *input_params = pl_tex_params(
+        .w          = w,
+        .h          = h,
+        .format     = fmt,
+        .sampleable = true,
+        .renderable = true,
+        .storable   = fmt->caps & PL_FMT_CAP_STORABLE,
+    );
+
+    const struct pl_tex_params *flow_params = pl_tex_params(
+        .w          = grid_w,
+        .h          = grid_h,
+        .format     = mv_fmt,
+        .sampleable = true,
+        .storable   = true,
+    );
+
+    for (int d = 0; d < NUM_DIRS; d++) {
+        if (!(direction & (1 << d)))
+            continue;
+        if (!pl_pyramid_recreate(gpu, obj, &obj->dir[d].coarse, levels,
+                                 flow_params))
+            goto error;
+    }
+
+    if (!pl_pyramid_recreate(gpu, obj, &obj->scratch.raw, levels, flow_params))
+        goto error;
+
+    int refine[MOTION_MAX_REFINE_PASSES];
+    const int num_refine = refine_plan(params, refine);
+    for (int d = 0; d < NUM_DIRS; d++) {
+        if (!(direction & (1 << d)))
+            continue;
+        if (!refine_pyramid_recreate(gpu, obj, &obj->dir[d].fine, w, h,
+                                     refine, num_refine, mv_fmt))
+            goto error;
+    }
+
+    // Only the levels below the top one compensate the gain
+    for (int i = 0; levels > 1 && i < NUM_DIRS; i++) {
+        if (!(direction & (1 << i)))
+            continue;
+        obj->dir[i].gain = pl_buf_create(gpu, pl_buf_params(
+            .size        = sizeof(float),
+            .storable    = true,
+            .memory_type = PL_BUF_MEM_DEVICE,
+            .debug_tag   = PL_DEBUG_TAG,
+        ));
+
+        if (!obj->dir[i].gain) {
+            PL_ERR(gpu, "pl_motion_estimate: failed creating gain buffer!");
+            goto error;
+        }
+    }
+
+    if (!pl_pyramid_recreate(gpu, obj, &obj->pyramid_prev,  levels, input_params) ||
+        !pl_pyramid_recreate(gpu, obj, &obj->scratch.input, levels, input_params))
+        goto error;
+
+    if (features & PL_MOTION_QUALITY) {
+        pl_fmt qfmt = pl_find_fmt(gpu, PL_FMT_UNORM, 1, 8, 8,
+                                  PL_FMT_CAP_STORABLE | PL_FMT_CAP_LINEAR);
+        if (!qfmt) {
+            PL_ERR(gpu, "pl_motion_estimate: no storable, linearly filterable "
+                        "single component format available!");
+            goto error;
+        }
+
+        const int qw = PL_DIV_UP(w, MOTION_QUALITY_SUB);
+        const int qh = PL_DIV_UP(h, MOTION_QUALITY_SUB);
+        for (int d = 0; d < NUM_DIRS; d++) {
+            if (!(direction & (1 << d)))
+                continue;
+            bool ok = pl_tex_recreate(gpu, &obj->dir[d].quality, pl_tex_params(
+                .w          = qw,
+                .h          = qh,
+                .format     = qfmt,
+                .sampleable = true,
+                .storable   = true,
+            ));
+            if (!ok) {
+                PL_ERR(gpu, "pl_motion_estimate: failed creating %dx%d quality "
+                            "texture!", qw, qh);
+                goto error;
+            }
+        }
+    }
+
+    if (features & PL_MOTION_GLOBAL) {
+        if (!global_buf_create(gpu, &obj->scratch.hist,
+                               2 * MOTION_GLOBAL_BINS * sizeof(uint32_t),
+                               false))
+            goto error;
+
+        for (int d = 0; d < NUM_DIRS; d++) {
+            if (!(direction & (1 << d)))
+                continue;
+            if (!global_buf_create(gpu, &obj->dir[d].global_flow,
+                                   sizeof(struct global_buf_data), true))
+                goto error;
+        }
+    }
+
+    return true;
+
+error:
+    motion_uninit(gpu, obj);
+    return false;
 }
 
 bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
@@ -2124,7 +2266,14 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
     if (!input || !input->gpu || !input->dispatch || !input->state)
         return false;
 
-    params = PL_DEF(params, &pl_motion_estimate_default_params);
+    struct pl_motion_estimate_params fixed;
+    if (!params) {
+        params = &pl_motion_estimate_default_params;
+    } else {
+        fixed = *params;
+        fix_params(&fixed);
+        params = &fixed;
+    }
 
     pl_gpu gpu = input->gpu;
     struct sh_motion_obj *obj =
@@ -2140,148 +2289,32 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
 
     const int w = input->a.tex->params.w;
     const int h = input->a.tex->params.h;
-    const char *changed = NULL;
-    if (w != obj->w || h != obj->h) {
-        changed = "input dimensions changed";
-    } else if (!params_eq(&obj->params, params)) {
-        changed = "parameters changed";
-    }
+    if (!motion_setup(gpu, obj, w, h, params, input->direction,
+                      input->features))
+        return false;
 
-    if (changed) {
-        invalidate_temporal(gpu, obj, changed);
-        obj->params = *params;
-        obj->w = w;
-        obj->h = h;
-    }
-
-    if (obj->sig_a == input->a.sig && obj->sig_b == input->b.sig &&
-        (obj->flow.valid & input->direction) == input->direction)
+    if (obj->sig_prev == input->a.sig && obj->sig_next == input->b.sig &&
+        (obj->valid & input->direction) == input->direction)
     {
-        // Same frame pair as the previous call, at most the global motion
-        // and the quality are left to compute.
-        if (input->estimate_global && !obj->global.valid) {
-            for (int i = 0; i < NUM_DIRS; i++) {
-                const enum pl_motion_direction dir = 1 << i;
-                if ((obj->flow.valid & dir) &&
-                    !estimate_global(gpu, input->dispatch, obj, dir))
-                    goto error;
-            }
-
-            obj->global.valid = true;
-        }
-
-        if (input->estimate_quality && !obj->quality.valid) {
-            // The pyramids were swapped at the end of the previous call
-            if (!estimate_quality(gpu, input->dispatch, obj,
-                                  obj->scratch.levels.elem[0],
-                                  obj->pyramid_prev.elem[0]))
-                goto error;
-
-            obj->quality.valid = true;
-        }
-
+        // Same frame pair as the previous call
         return true;
     }
 
-    if (obj->sig_b != input->a.sig) {
+    if (obj->sig_next != input->a.sig) {
         invalidate_temporal(
             gpu, obj,
             "frame signature of first frame not equal to frame signature "
             "of second frame from previous call");
     }
 
-    obj->sig_a = input->a.sig;
-    obj->sig_b = input->b.sig;
+    obj->sig_prev = input->a.sig;
+    obj->sig_next = input->b.sig;
 
-    const int levels = pyramid_num_levels(w, h, params);
-    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 1, 16, 0,
-                             PL_FMT_CAP_LINEAR | PL_FMT_CAP_RENDERABLE);
-    if (!fmt) {
-        PL_ERR(gpu, "pl_motion_estimate: no renderable, linearly filterable "
-                    "single component float format available!");
-        goto error;
-    }
-
-    // The search covers the trailing partial blocks as well, hence ceiling
-    // division.
-    obj->grid_w = PL_DIV_UP(w, params->block_size_coarse);
-    obj->grid_h = PL_DIV_UP(h, params->block_size_coarse);
-
-    pl_fmt mv_fmt = flow_fmt(gpu);
-    if (!mv_fmt) {
-        PL_ERR(gpu, "pl_motion_estimate: no storable, linearly filterable "
-                    "two component float format available!");
-        goto error;
-    }
-
-    const struct pl_tex_params *luma_params = pl_tex_params(
-        .w          = w,
-        .h          = h,
-        .format     = fmt,
-        .sampleable = true,
-        .renderable = true,
-        .storable   = fmt->caps & PL_FMT_CAP_STORABLE,
-        .debug_tag  = PL_DEBUG_TAG,
-    );
-
-    const struct pl_tex_params *flow_params = pl_tex_params(
-        .w          = obj->grid_w,
-        .h          = obj->grid_h,
-        .format     = mv_fmt,
-        .sampleable = true,
-        .storable   = true,
-        .debug_tag  = PL_DEBUG_TAG,
-    );
-
-    // These are no-ops as long as the motion search shape stays the same.
-    // Otherwise, they invalidate the no longer usable temporal prior that resides
-    // in `obj->flow.field`.
-    for (int d = 0; d < NUM_DIRS; d++) {
-        if ((input->direction & (1 << d)) &&
-            !pl_pyramid_recreate(gpu, obj, &obj->flow.field[d], levels,
-                                 flow_params))
-            goto error;
-    }
-
-    if (!pl_pyramid_recreate(gpu, obj, &obj->scratch.raw, levels, flow_params))
-        goto error;
-
-    if (!pl_pyramid_recreate(gpu, obj, &obj->scratch.filtered, levels,
-                             flow_params))
-        goto error;
-
-    int refine[MOTION_MAX_REFINE_PASSES];
-    const int num_refine = refine_plan(params, refine);
-    for (int d = 0; d < NUM_DIRS; d++) {
-        if ((input->direction & (1 << d)) &&
-            !refine_pyramid_recreate(gpu, obj, &obj->flow.fine[d], w, h,
-                                     refine, num_refine, mv_fmt))
-            goto error;
-    }
-
-    pl_fmt gain_fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 1, 32, 32, PL_FMT_CAP_STORABLE);
-
-    for (int i = 0; i < NUM_DIRS; i++) {
-        bool ok = pl_tex_recreate(gpu, &obj->gain[i], pl_tex_params(
-            .w          = 1,
-            .h          = 1,
-            .format     = PL_DEF(gain_fmt, mv_fmt),
-            .sampleable = true,
-            .storable   = true,
-        ));
-
-        if (!ok) {
-            PL_ERR(gpu, "pl_motion_estimate: failed creating brightness gain!");
-            goto error;
-        }
-    }
+    const int levels = obj->scratch.input.num;
 
     // Upon cold start or after reset, build the image pyramid for frame `a`,
     // use cached pyramid otherwise.
     if (!obj->pyramid_valid) {
-        if (!pl_pyramid_recreate(gpu, obj, &obj->pyramid_prev, levels,
-                                 luma_params))
-            goto error;
         if (!convert_to_luma(input->dispatch, &input->a,
                              obj->pyramid_prev.elem[0]))
         {
@@ -2293,16 +2326,13 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
             goto error;
     }
 
-    if (!pl_pyramid_recreate(gpu, obj, &obj->scratch.levels, levels,
-                             luma_params))
-        goto error;
     if (!convert_to_luma(input->dispatch, &input->b,
-                         obj->scratch.levels.elem[0]))
+                         obj->scratch.input.elem[0]))
     {
         PL_ERR(gpu, "pl_motion_estimate: failed converting frame b to luma!");
         goto error;
     }
-    if (!pl_pyramid_build(gpu, input->dispatch, &obj->scratch.levels))
+    if (!pl_pyramid_build(gpu, input->dispatch, &obj->scratch.input))
         goto error;
 
     void *tmp = pl_tmp(NULL);
@@ -2312,20 +2342,20 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
         if (!(input->direction & dir))
             continue;
 
-        pl_tex_pyramid *field = &obj->flow.field[d];
+        pl_tex_pyramid *field = &obj->dir[d].coarse;
 
         enum motion_prior prior_kind = MOTION_PRIOR_SAME;
         pl_tex_pyramid *prior_field = field;
-        if (d == FWD && (obj->flow.valid & PL_MOTION_BACKWARD)) {
+        if (d == FWD && (obj->valid & PL_MOTION_BACKWARD)) {
             prior_kind = MOTION_PRIOR_NEGATE;
-            prior_field = &obj->flow.field[BWD];
+            prior_field = &obj->dir[BWD].coarse;
         } else if (d == BWD && (input->direction & PL_MOTION_FORWARD)) {
             prior_kind = MOTION_PRIOR_INVERT;
-            prior_field = &obj->flow.field[FWD];
+            prior_field = &obj->dir[FWD].coarse;
         }
 
         const bool has_prior = prior_kind != MOTION_PRIOR_SAME ||
-                               (obj->flow.valid & dir);
+                               (obj->valid & dir);
 
         for (int i = levels - 1; i >= 0; i--) {
             // The top level has no vectors of a coarser level to start from,
@@ -2334,32 +2364,30 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
             // the match of the content. Its vectors then measure that change,
             // which the levels below compensate.
             const bool top = i == levels - 1;
-            pl_tex gain = top ? NULL : obj->gain[d];
+            pl_buf gain = top ? NULL : obj->dir[d].gain;
             const bool coarsest = levels > 1 && top;
-            const int radius = coarsest ? params->search_radius_coarse
-                                        : params->search_radius_fine;
 
             pl_tex raw = obj->scratch.raw.elem[i];
-            pl_tex out = obj->scratch.filtered.elem[i];
+            pl_tex out = field->elem[i];
 
             // The frames in the order of the direction
             pl_tex luma[2] = {
                 obj->pyramid_prev.elem[i],
-                obj->scratch.levels.elem[i],
+                obj->scratch.input.elem[i],
             };
 
             // Use the parent motion search to seed this levels search, for
             // all levels but the coarsest. The parent is the motion field
             // after smoothing.
             pl_tex parent =
-                i < levels - 1 ? obj->scratch.filtered.elem[i + 1] : NULL;
+                i < levels - 1 ? field->elem[i + 1] : NULL;
 
             // Seed the motion search using the prior at the corresponding
             // level of the motion search pyramid.
             pl_tex prior = has_prior ? prior_field->elem[i] : NULL;
 
             struct motion_geometry geom;
-            ok = motion_plan(gpu, tmp, params->block_size_coarse, radius,
+            ok = motion_plan(gpu, tmp, params, coarsest,
                              motion_seeds_plan(parent != NULL, prior != NULL),
                              i == 0, top, out->params.w, out->params.h,
                              &geom);
@@ -2382,16 +2410,14 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
             if (!ok)
                 break;
 
-            ok = motion_smooth_pass(gpu, input->dispatch,
-                                    params->block_size_coarse, luma[d],
+            ok = motion_smooth_pass(gpu, input->dispatch, params, luma[d],
                                     luma[!d], gain, raw, out);
             if (!ok)
                 break;
 
             if (top && i > 0) {
-                ok = motion_gain_pass(gpu, input->dispatch,
-                                      params->block_size_coarse, luma[d],
-                                      luma[!d], out, obj->gain[d]);
+                ok = motion_gain_pass(gpu, input->dispatch, params, luma[d],
+                                      luma[!d], out, obj->dir[d].gain);
                 if (!ok)
                     break;
             }
@@ -2400,31 +2426,26 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
         if (!ok)
             break;
 
-        if (num_refine) {
+        if (obj->dir[d].fine.num) {
             pl_tex luma[2] = {
                 obj->pyramid_prev.elem[0],
-                obj->scratch.levels.elem[0],
+                obj->scratch.input.elem[0],
             };
             // The gain is that of the levels below the top one, if any
-            ok = refine_flow(gpu, input->dispatch, refine, &obj->flow.fine[d],
-                             params->block_size_coarse, luma[d], luma[!d],
-                             levels > 1 ? obj->gain[d] : NULL,
-                             obj->scratch.filtered.elem[0]);
+            ok = refine_flow(gpu, input->dispatch, params, &obj->dir[d].fine,
+                             luma[d], luma[!d], obj->dir[d].gain,
+                             field->elem[0]);
             if (!ok)
                 break;
         }
 
-        // NOTE: we assume that the prior forward motion field is safe to be
-        // overwritten by the backward motion search.
-        //
         // NOTE: motion estimation that succeeds on the forward motion
         // estimation call but fails on the backward motion estimation call
         // may leave sh_motion_obj in an incomplete state. we assume that if
         // the backward direction fails, the caller is not interested in the
         // forward direction results.
-        PL_SWAP(*field, obj->scratch.filtered);
 
-        if (input->estimate_global) {
+        if (input->features & PL_MOTION_GLOBAL) {
             ok = estimate_global(gpu, input->dispatch, obj, dir);
             if (!ok)
                 break;
@@ -2435,26 +2456,25 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
     if (!ok)
         goto error;
 
-    obj->flow.valid = input->direction;
-    obj->global.valid = input->estimate_global;
+    obj->valid = input->direction;
 
-    if (input->estimate_quality) {
+    if (input->features & PL_MOTION_QUALITY) {
         if (!estimate_quality(gpu, input->dispatch, obj,
                               obj->pyramid_prev.elem[0],
-                              obj->scratch.levels.elem[0]))
+                              obj->scratch.input.elem[0]))
             goto error;
     }
 
-    obj->quality.valid = input->estimate_quality;
 
     // Cache frame `b`'s luma pyramid, use reuse `a` buffers as scratch.
-    PL_SWAP(obj->pyramid_prev, obj->scratch.levels);
+    PL_SWAP(obj->pyramid_prev, obj->scratch.input);
     obj->pyramid_valid = true;
 
     return true;
 
 error:
-    invalidate_temporal(gpu, obj, "estimation failed");
+    // Don't leave behind partially updated or allocated objects
+    motion_uninit(gpu, obj);
     return false;
 }
 
@@ -2683,11 +2703,11 @@ bool pl_shader_frame_interp(pl_shader sh,
 
     struct pl_motion_estimate_params me_params = params->motion;
     enum pl_motion_direction me_dir;
-    bool me_global = false, me_quality = false;
+    enum pl_motion_feature me_features = 0;
     switch (params->algo) {
     case PL_FRAME_INTERP_GLOBAL_MOTION:
         me_dir = PL_MOTION_FORWARD;
-        me_global = true;
+        me_features = PL_MOTION_GLOBAL;
         // The global motion is estimated from the blocks, refining the
         // fields would be wasted
         me_params.block_size_fine = me_params.block_size_coarse;
@@ -2695,7 +2715,7 @@ bool pl_shader_frame_interp(pl_shader sh,
     case PL_FRAME_INTERP_VISUALIZE:
     case PL_FRAME_INTERP_QUALITY:
         me_dir = PL_MOTION_FORWARD;
-        me_quality = true;
+        me_features = PL_MOTION_QUALITY;
         break;
     case PL_FRAME_INTERP_ALGO_COUNT:
     default:
@@ -2711,8 +2731,7 @@ bool pl_shader_frame_interp(pl_shader sh,
         .a         = input->a,
         .b         = input->b,
         .direction = me_dir,
-        .estimate_global = me_global,
-        .estimate_quality = me_quality,
+        .features  = me_features,
         .state     = input->state,
     ), &me_params);
     if (!ok)
